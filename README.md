@@ -242,3 +242,7 @@ npm run typecheck
 - **Language:** TypeScript (strict mode)
 - **Media processing:** Sharp + FFmpeg (VPS only)
 - **Tooling:** wrangler v4, Node.js 22+ (CI uses Node.js 24)
+
+## Credits
+
+Based on [tg-s3](https://github.com/gps949/tg-s3) by [gps949](https://github.com/gps949). Thanks to the original author for the project this template is built on.

@@ -242,3 +242,7 @@ Cần `X_LOCAL_EXPLORER=false` với wrangler 4.90: vì `database_id` trong `wra
 - **Ngôn ngữ:** TypeScript (strict mode)
 - **Xử lý media:** Sharp + FFmpeg (chỉ trên VPS)
 - **Công cụ:** wrangler v4, Node.js 22+ (CI dùng Node.js 24)
+
+## Ghi công
+
+Dựa trên dự án [tg-s3](https://github.com/gps949/tg-s3) của [gps949](https://github.com/gps949). Cảm ơn tác giả gốc đã xây dựng nền tảng cho template này.
