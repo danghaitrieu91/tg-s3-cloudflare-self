@@ -1,0 +1,26 @@
+name = "tg-s3-self"
+main = "src/index.ts"
+compatibility_date = "2026-03-15"
+workers_dev = true
+
+# Secrets (set via GitHub Actions or `wrangler secret put`), NOT here:
+#   TG_BOT_TOKEN, DEFAULT_CHAT_ID, WORKER_URL, TG_ADMIN_IDS, SSE_MASTER_KEY, VPS_URL, VPS_SECRET
+# Web upload (public drag-and-drop page at "/"): ON by default. Set to "off" to disable. See docs/web-upload.md
+
+[vars]
+S3_REGION = "us-east-1"
+WEB_UPLOAD_BUCKET = "files"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-s3-self-db"
+# D1 ID below stays empty in git; CI / deploy.sh fill it in (keep the value line comment-free)
+database_id = ""
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "CACHE"
+bucket_name = "tg-s3-self-cache"
+
+[triggers]
+crons = ["0 */6 * * *"]

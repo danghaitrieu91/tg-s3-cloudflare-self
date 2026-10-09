@@ -1,0 +1,8 @@
+node_modules
+processor/node_modules
+.env
+.wrangler
+.git
+.dev.vars
+*.pem
+*.key

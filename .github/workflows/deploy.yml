@@ -1,0 +1,186 @@
+# Fork-ready deployment to Cloudflare Workers.
+# Setup (Secrets, Variables, one-time steps): see docs/deployment.md
+# The job is skipped unless the repository variable DEPLOY_ENABLED is "true".
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      D1_NAME: tg-s3-self-db
+      R2_NAME: tg-s3-self-cache
+      CUSTOM_DOMAIN: ${{ vars.CUSTOM_DOMAIN }}
+      WEB_UPLOAD_BUCKET: ${{ vars.WEB_UPLOAD_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        # Do not expose the Cloudflare credentials to npm lifecycle scripts
+        env:
+          CLOUDFLARE_API_TOKEN: ''
+          CLOUDFLARE_ACCOUNT_ID: ''
+        run: npm ci
+
+      - name: Validate required secrets
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          DEFAULT_CHAT_ID: ${{ secrets.DEFAULT_CHAT_ID }}
+          TG_ADMIN_IDS: ${{ secrets.TG_ADMIN_IDS }}
+        run: |
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID TG_BOT_TOKEN DEFAULT_CHAT_ID TG_ADMIN_IDS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required repository secret: $name (see docs/deployment.md)"
+              missing=1
+            fi
+          done
+          if [ -n "$CUSTOM_DOMAIN" ] && ! [[ "$CUSTOM_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+            echo "::error::Variable CUSTOM_DOMAIN must be a bare hostname like files.example.com (no https://, no path)"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Ensure D1 database
+        run: |
+          find_db_id() {
+            local out
+            out="$(npx wrangler d1 list --json)" || return 1
+            printf '%s' "$out" | node -e "
+              const list = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+              const db = list.find((d) => d.name === process.env.D1_NAME);
+              process.stdout.write(db ? db.uuid : '');
+            "
+          }
+          if ! DB_ID="$(find_db_id)"; then
+            echo "::error::wrangler d1 list failed (check CLOUDFLARE_ACCOUNT_ID and that the API token has D1: Edit)"
+            exit 1
+          fi
+          if [ -z "$DB_ID" ]; then
+            echo "Creating D1 database $D1_NAME"
+            npx wrangler d1 create "$D1_NAME"
+            DB_ID="$(find_db_id)" || true
+          fi
+          if [ -z "$DB_ID" ]; then
+            echo "::error::Could not find or create D1 database $D1_NAME"
+            exit 1
+          fi
+          echo "D1 database $D1_NAME: $DB_ID"
+          # Workspace-only edit (never committed)
+          sed -i "s/^database_id = \"\"/database_id = \"$DB_ID\"/" wrangler.toml
+          grep -q "^database_id = \"$DB_ID\"" wrangler.toml
+
+      - name: Ensure R2 cache bucket
+        run: |
+          if out="$(npx wrangler r2 bucket create "$R2_NAME" 2>&1)"; then
+            echo "Created R2 bucket $R2_NAME"
+          elif echo "$out" | grep -qi "already exists"; then
+            echo "R2 bucket $R2_NAME already exists"
+          else
+            echo "$out"
+            echo "::error::Could not create R2 bucket $R2_NAME"
+            exit 1
+          fi
+
+      - name: Configure custom domain
+        if: vars.CUSTOM_DOMAIN != ''
+        run: |
+          # Workspace-only edits: route the custom domain and close the unprotected *.workers.dev URL
+          sed -i 's/^workers_dev = true/workers_dev = false/' wrangler.toml
+          printf '\n[[routes]]\npattern = "%s"\ncustom_domain = true\n' "$CUSTOM_DOMAIN" >> wrangler.toml
+          grep -q '^workers_dev = false' wrangler.toml
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply "$D1_NAME" --remote
+
+      - name: Deploy Worker
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          DEFAULT_CHAT_ID: ${{ secrets.DEFAULT_CHAT_ID }}
+          TG_ADMIN_IDS: ${{ secrets.TG_ADMIN_IDS }}
+          SSE_MASTER_KEY: ${{ secrets.SSE_MASTER_KEY }}
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_SECRET: ${{ secrets.VPS_SECRET }}
+        run: |
+          # Secrets are uploaded together with the code (--secrets-file), so the new version never runs without them.
+          SECRETS_FILE="$RUNNER_TEMP/secrets.json"
+          trap 'rm -f "$SECRETS_FILE"' EXIT
+          node -e "
+            const names = ['TG_BOT_TOKEN', 'DEFAULT_CHAT_ID', 'TG_ADMIN_IDS', 'SSE_MASTER_KEY', 'VPS_URL', 'VPS_SECRET'];
+            const out = {};
+            for (const n of names) if (process.env[n]) out[n] = process.env[n];
+            if (process.env.CUSTOM_DOMAIN) out.WORKER_URL = 'https://' + process.env.CUSTOM_DOMAIN;
+            require('fs').writeFileSync(process.argv[1], JSON.stringify(out), { mode: 0o600 });
+          " "$SECRETS_FILE"
+
+          args=(--secrets-file "$SECRETS_FILE")
+          if [ -n "$WEB_UPLOAD_BUCKET" ]; then
+            args+=(--var "WEB_UPLOAD_BUCKET:$WEB_UPLOAD_BUCKET")
+          fi
+          effective="${WEB_UPLOAD_BUCKET:-files}"
+          if [ "$(echo "$effective" | tr '[:upper:]' '[:lower:]')" = "off" ]; then
+            echo "::notice::Web upload is OFF (WEB_UPLOAD_BUCKET=off)."
+          else
+            echo "::notice::Web upload is ON: anyone with the Worker URL can upload files to bucket '$effective' (no login). See docs/web-upload.md"
+          fi
+
+          set -o pipefail
+          npx wrangler deploy "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/deploy.log"
+
+      - name: Resolve Worker URL
+        run: |
+          if [ -n "$CUSTOM_DOMAIN" ]; then
+            WORKER_URL="https://$CUSTOM_DOMAIN"
+          else
+            WORKER_URL="$(grep -oE 'https://[^ ]+\.workers\.dev' "$RUNNER_TEMP/deploy.log" | head -1 || true)"
+            if [ -z "$WORKER_URL" ]; then
+              echo "::error::Could not find the workers.dev URL in the deploy output"
+              exit 1
+            fi
+            echo "{\"WORKER_URL\":\"$WORKER_URL\"}" | npx wrangler secret bulk
+          fi
+          echo "WORKER_URL=$WORKER_URL" >> "$GITHUB_ENV"
+          echo "Worker URL: $WORKER_URL"
+
+      - name: Register Telegram webhook
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          # Same derivation as src/utils/crypto.ts and deploy.sh: HMAC-SHA256(key=TG_BOT_TOKEN, msg="tg-s3-webhook") hex
+          WEBHOOK_SECRET="$(node -e "const c=require('crypto');process.stdout.write(c.createHmac('sha256',process.env.TG_BOT_TOKEN).update('tg-s3-webhook').digest('hex'))")"
+          BODY="$(WEBHOOK_SECRET="$WEBHOOK_SECRET" node -e "process.stdout.write(JSON.stringify({url: process.env.WORKER_URL + '/bot/webhook', secret_token: process.env.WEBHOOK_SECRET}))")"
+          # Never use -v: the request URL contains the bot token
+          RES="$(curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook" \
+            -H 'Content-Type: application/json' -d "$BODY")" || { echo "::error::Could not reach api.telegram.org"; exit 1; }
+          if ! echo "$RES" | node -e "
+            const r = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+            if (r.ok !== true) { console.log('::error::setWebhook failed: ' + (r.description || 'unknown error')); process.exit(1); }
+          "; then
+            exit 1
+          fi
+          echo "Webhook registered: $WORKER_URL/bot/webhook"
