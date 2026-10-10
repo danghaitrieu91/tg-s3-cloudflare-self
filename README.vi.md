@@ -256,3 +256,7 @@ Cần `X_LOCAL_EXPLORER=false` với wrangler 4.90: vì `database_id` trong `wra
 ## Ghi công
 
 Dựa trên dự án [tg-s3](https://github.com/gps949/tg-s3) của [gps949](https://github.com/gps949). Cảm ơn tác giả gốc đã xây dựng nền tảng cho template này.
+
+## Giấy phép
+
+[MIT](LICENSE). Anh có thể dùng, sửa và phân phối template này, kể cả cho mục đích thương mại, miễn là giữ nguyên thông báo bản quyền và giấy phép trong các bản sao. Không có bảo hành.

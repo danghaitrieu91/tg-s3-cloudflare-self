@@ -256,3 +256,7 @@ npm run typecheck
 ## Credits
 
 Based on [tg-s3](https://github.com/gps949/tg-s3) by [gps949](https://github.com/gps949). Thanks to the original author for the project this template is built on.
+
+## License
+
+[MIT](LICENSE). You may use, modify, and distribute this template, including in commercial projects, as long as the copyright and permission notice stay in copies. There is no warranty.

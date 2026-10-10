@@ -1,6 +1,7 @@
 {
   "name": "tg-s3-self",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "engines": {
     "node": ">=22.18"
