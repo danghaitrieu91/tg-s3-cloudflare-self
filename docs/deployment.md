@@ -25,11 +25,11 @@ All configuration options are listed in [configuration.md](configuration.md). Th
 2. **Telegram supergroup** — create a group, add your bot as an **administrator**, and get its chat ID (a negative number starting with `-100`, for example `-1001234567890`). One way: add [@userinfobot](https://t.me/userinfobot) to the group temporarily, or send a message in the group and open `https://api.telegram.org/bot<TOKEN>/getUpdates` and look for `chat.id`.
 3. **Your Telegram user ID** — send any message to [@userinfobot](https://t.me/userinfobot). It goes into `TG_ADMIN_IDS` (required).
 4. **Cloudflare account** with **R2 activated** — R2 needs a subscription even for the free usage tier: dashboard → **Storage & databases → R2 → Overview** → complete the checkout flow. Source: [R2 get started](https://developers.cloudflare.com/r2/get-started/).
-5. Path B / local development only: **Node.js 22+** (the project uses wrangler v4).
+5. Path B / local development only: **Node.js 22.18+** (the project uses wrangler v4; `npm test` needs Node's built-in TypeScript type stripping).
 
 ## Path A: GitHub Actions
 
-The workflow is `.github/workflows/deploy.yml`. It runs on every push to `main` and on manual runs, but the job is **skipped** until you set the repository Variable `DEPLOY_ENABLED` to `true`.
+The workflow is `.github/workflows/deploy.yml`. It runs on every push to `main` and on manual runs, but the deploy job is **skipped** until you set the repository Variable `DEPLOY_ENABLED` to `true`. A separate `test` job (type check and unit tests, no secrets) runs first on every push and on every pull request, also in forks; the deploy job only starts after it passes and never runs for pull requests.
 
 > [!NOTE]
 > The workflow has not been run end-to-end by the template authors; your fork's first run is the real test. If a step fails, see [Troubleshooting (Path A)](#troubleshooting-path-a).
@@ -107,14 +107,17 @@ Same page, **Variables** tab → **New repository variable**.
 
 | Step | What happens |
 |------|--------------|
+| Test (job `test`) | `npm ci`, `npm run typecheck`, `npm test`. Runs on pushes and pull requests without any secret; a failure stops the deploy |
 | Validate required secrets | Fails with `Missing required repository secret: <NAME>` if any of `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `TG_BOT_TOKEN`, `DEFAULT_CHAT_ID`, `TG_ADMIN_IDS` is empty, and with `Variable CUSTOM_DOMAIN must be a bare hostname …` if `CUSTOM_DOMAIN` is not a plain hostname |
 | Ensure D1 database | Looks up `tg-s3-self-db` (`wrangler d1 list --json`), creates it if missing, and writes its ID into `wrangler.toml` **in the CI workspace only** (never committed). Fails with `wrangler d1 list failed …` if the lookup itself fails |
 | Ensure R2 cache bucket | Creates `tg-s3-self-cache`; "already exists" is treated as success |
 | Configure custom domain | Only if `CUSTOM_DOMAIN` is set: appends `[[routes]] pattern = "<domain>" custom_domain = true` and sets `workers_dev = false` (workspace only) |
+| D1 bookmark | Prints `D1 bookmark before migrations: <id>` as a notice in the run summary: a D1 Time Travel restore point taken before the migrations (see [Backups and restore](#backups-and-restore)). Only a warning on a brand-new database |
 | Apply D1 migrations | `wrangler d1 migrations apply tg-s3-self-db --remote` |
 | Deploy Worker | `wrangler deploy --secrets-file …`: secrets are uploaded together with the code. Adds `--var WEB_UPLOAD_BUCKET:<value>` only if the Variable is set. Prints a notice saying whether web upload is ON or OFF |
 | Resolve Worker URL | `https://<CUSTOM_DOMAIN>`, or the `*.workers.dev` URL parsed from the deploy output, which is then stored as the `WORKER_URL` secret |
 | Register Telegram webhook | Calls `setWebhook` with `<WORKER_URL>/bot/webhook` and a secret token derived from the bot token (HMAC-SHA256). Fails the job if Telegram does not answer `ok` |
+| Smoke test | Requests `<WORKER_URL>/tgs3-smoke-nonexistent/x` without credentials (up to 12 tries, 10 s apart) and expects `403` with the Worker's S3 error body `<Code>AccessDenied</Code>`, which proves that the new version reads D1 and runs the S3 auth path. A `403` from the edge (WAF, Access) does not count. Any other result fails the job |
 
 ### Custom domain
 
@@ -134,6 +137,7 @@ CI also sets `workers_dev = false`, so the `*.workers.dev` URL stops serving the
 - D1 migrations are applied on every run; already-applied migrations are skipped.
 - Keep `database_id = ""` committed in `wrangler.toml`; CI fills it in its workspace.
 - Removing an optional Secret (for example `VPS_URL` or `SSE_MASTER_KEY`) from GitHub does **not** remove it from the Worker: deploys keep the secrets already stored there. Delete it from the Worker as well with `npx wrangler secret delete <NAME> --name tg-s3-self`.
+- Pull requests (including from forks) only run the `test` job; nothing is deployed until the change lands on `main`.
 
 ### Troubleshooting (Path A)
 
@@ -152,6 +156,12 @@ CI also sets `workers_dev = false`, so the `*.workers.dev` URL stops serving the
 | `Could not reach api.telegram.org` | Network error from the runner; re-run the job |
 | Custom domain errors during deploy | The zone is not on the same account, or the token lacks the Zone permissions |
 | Bot does not answer | Talk to it in a **private** chat; check that your user ID is in `TG_ADMIN_IDS`; check `getWebhookInfo` (see [Verify the deployment](#verify-the-deployment)) |
+| `Smoke test failed (HTTP <code>, expected 403 AccessDenied from the Worker)` | The new version is **already live** but does not answer correctly. `403-unexpected` means a 403 without the Worker's `AccessDenied` body: a WAF rule or Cloudflare Access is blocking the path, so allow it for S3 paths. `500` usually means a D1 or migration problem; `000`, `404` or `52x` usually means the URL is not serving yet (a new custom domain can take a few minutes — re-run the workflow). Check `npx wrangler tail tg-s3-self`, then fix and push, or roll the code back with `npx wrangler rollback --name tg-s3-self`. If a migration damaged data, restore D1 to the bookmark printed by the same run ([Backups and restore](#backups-and-restore)) |
+| D1 backup: `getMe failed: … (TG_BOT_TOKEN invalid or revoked?)` | The backup itself already ran (this check runs after the upload, even if an earlier step failed), but Telegram rejects the bot token, so the bot is dead and cannot send alerts either. Get a new token from @BotFather if it was revoked, update the `TG_BOT_TOKEN` Secret, re-run **Deploy to Cloudflare Workers** (it uploads the token and re-registers the webhook), then re-run **D1 backup** |
+| D1 backup: `No Telegram webhook is set; …` | The backup itself already ran, but the bot is not receiving messages. The next cron run (every 6 hours) re-registers the webhook if `WORKER_URL` is set; to fix it now, re-run **Deploy to Cloudflare Workers** |
+| D1 backup: `D1 database tg-s3-self-db not found; not creating it` | The backup job never creates the database, so it cannot back up an empty replacement over good dumps. Check that `CLOUDFLARE_ACCOUNT_ID` is the right account. If the database is really gone, follow [Restore after the database is gone](#restore-after-the-database-is-gone) |
+| D1 backup: `Could not read d1/last-count.json from tg-s3-self-backup; refusing to run without the shrink guard` | Reading the previous counts failed for a reason other than "the key does not exist" (network, permissions). The job stops instead of running without the guard. Check that the token has **Workers R2 Storage: Edit**, then re-run **D1 backup** |
+| D1 backup: `refusing to overwrite backups: objects N -> M` | The number of objects in the verified dump dropped to 0 or below half of the last good backup. Nothing was uploaded; the existing backups are untouched. If this is unexpected, investigate and restore ([Backups and restore](#backups-and-restore)). If you deleted the files on purpose, accept the new count as described in [Daily backup](#daily-backup-github-actions) |
 
 ## Path B: `deploy.sh`
 
@@ -263,6 +273,14 @@ git pull
 ./deploy.sh          # or ./deploy.sh --vps
 ```
 
+The third-party images (`aiogram/telegram-bot-api`, `cloudflare/cloudflared`) are not pinned to a version and are pulled only once: `deploy.sh` never pulls them again, so re-running it does not upgrade them. Upgrade deliberately, in the directory with `docker-compose.yml` (on the server for `--vps`), and check the logs afterwards:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+These services sit behind Compose profiles, so add the profiles you run to both commands, e.g. `docker compose --profile tunnel --profile localapi pull && docker compose --profile tunnel --profile localapi up -d`.
+
 Useful Docker commands: `docker compose --profile tunnel logs -f`, `docker compose --profile tunnel restart`, `docker compose --profile tunnel down`.
 
 ### Troubleshooting (Path B)
@@ -277,6 +295,103 @@ Useful Docker commands: `docker compose --profile tunnel logs -f`, `docker compo
 | Tunnel not created / processor "not reachable from outside" | Set `CF_CUSTOM_DOMAIN`, add **Cloudflare Tunnel: Edit** and **DNS: Edit** to the token, run again; or set `CF_TUNNEL_TOKEN` + `VPS_URL` manually |
 | Processor problems | `docker compose logs processor` (on the server for `--vps`: `ssh <VPS_SSH> 'cd /opt/tg-s3-self && docker compose logs'`) |
 | SSH failures in `--vps` mode | Key-based SSH must work non-interactively: `ssh -o BatchMode=yes <VPS_SSH> echo ok` |
+
+## Alerts
+
+The Worker's cron job (every 6 hours, both paths) sends a Telegram message titled **tg-s3 cron** to every user in `TG_ADMIN_IDS` when something needs attention. Each admin must send `/start` to the bot once, otherwise Telegram refuses to deliver the message. The cron job never deletes objects because of a Telegram error. Details of each step: [configuration.md → Cron maintenance tasks](configuration.md#cron-maintenance-tasks).
+
+| Alert | Meaning and what to do |
+|-------|------------------------|
+| `getFile 400 for N of M sampled (lost, or not readable by this bot). Nothing was deleted.` + up to 10 keys | Telegram no longer serves these files (for example the messages were deleted from the storage group). Check the group; delete the listed objects yourself (bot `/delete`, Mini App or S3) if they are really gone |
+| `All probes returned 400: TG_BOT_TOKEN is valid but probably belongs to a different bot …` | File IDs only work with the bot that uploaded them. `TG_BOT_TOKEN` was probably replaced by the token of another bot: put the original bot's token back and re-deploy |
+| `getFile returned 401 … TG_BOT_TOKEN invalid or revoked.` | Create a new token for the same bot in @BotFather, update the Secret (or `.env`) and re-deploy |
+| `Telegram unreachable or degraded: …` | At least half of the checks failed temporarily. Usually resolves by itself; act only if it repeats |
+| `Webhook was missing → re-registered.` | Information only: the webhook was empty and the cron job set it again |
+| `Webhook re-register FAILED …`, `Webhook: getWebhookInfo failed …` | Telegram refused or did not answer. Re-run the deploy (Path A workflow or `./deploy.sh`) |
+| `Webhook points to another host (…); not changed.` | Another deployment (or a manual `setWebhook`) took over the bot. The cron job does not take it back; re-deploy this one if it should own the bot |
+| `Webhook error: …` | Telegram reported a delivery error in the last 6 hours. Check that the Worker URL works, then [Verify the deployment](#verify-the-deployment) |
+| `WORKER_URL not set: webhook self-heal disabled.` | Re-deploy so that CI or `deploy.sh` sets `WORKER_URL` |
+
+If there were alerts but none could be delivered (no admin has started the bot, or the token is revoked), the cron run ends with the error `cron alerts undelivered`, visible in the Cloudflare dashboard under the Worker's **Cron Events**. A revoked token cannot send any Telegram message, so with GitHub Actions the [daily backup job](#daily-backup-github-actions) is the fallback: after the backup it checks the token with `getMe` and fails, which triggers GitHub's workflow failure email. Keep GitHub notification emails turned on.
+
+## Backups and restore
+
+Two layers protect the D1 metadata (the files themselves stay in Telegram, but without D1 they cannot be found):
+
+| Layer | What | Where |
+|-------|------|-------|
+| D1 Time Travel | Point-in-time restore, built into D1, for as long as the database exists (retention: 7 days on Workers Free, 30 days on Workers Paid) | Cloudflare |
+| Daily export (Path A only) | `.github/workflows/backup.yml`: one full SQL snapshot per day | R2 bucket `tg-s3-self-backup` |
+
+`deploy.sh` (Path B) has no scheduled backup; Time Travel still applies.
+
+### Time Travel (first choice)
+
+Use it when the database still exists but its content is wrong (bad migration, mistaken mass delete). Every deploy run prints a restore point taken before migrations: open the run summary of **Deploy to Cloudflare Workers** and look for the notice `D1 bookmark before migrations: <id>`.
+
+```bash
+export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
+# restore to the bookmark printed by a deploy run
+npx wrangler d1 time-travel restore tg-s3-self-db --bookmark=<id>
+# or find a bookmark for a point in time, then restore it
+npx wrangler d1 time-travel info tg-s3-self-db --timestamp=2026-10-09T12:00:00Z
+```
+
+A restore replaces the whole database in place; wrangler prints a bookmark of the state before the restore, so it can be undone the same way. See [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+
+### Daily backup (GitHub Actions)
+
+- Runs daily at 03:17 UTC and on demand (**Actions → D1 backup → Run workflow**), only when `DEPLOY_ENABLED` is `true`. The job times out after 20 minutes.
+- It looks up `tg-s3-self-db` read-only and **never creates it**: if the database is missing the job fails with `D1 database tg-s3-self-db not found; not creating it`.
+- It exports the whole database in one `wrangler d1 export` (schema and data of every table, including `d1_migrations`, so new tables are included automatically), then **verifies** the dump by restoring it into a scratch local D1 on the runner. The counts stored in `d1/last-count.json` come from that restore.
+- It refuses to overwrite good backups (`refusing to overwrite backups: objects N -> M`) when the restored object count dropped to 0 or below 50% of the last good run. The very first run (no `d1/last-count.json` yet) accepts any count. Only a missing key counts as a first run: any other error reading the counts file stops the job (`Could not read d1/last-count.json …`).
+- It uploads `d1/<Mon..Sun>.sql` (7-day rolling) and `d1/monthly/<YYYY-MM>.sql`, then `d1/last-count.json` (layout: [configuration.md → Backup workflow](configuration.md#backup-workflow)).
+- After the upload it checks the bot with `getMe` and checks that a webhook is set. This check runs even when an earlier step failed, and a broken bot does not stop the backup, but it still fails the job, so GitHub sends its failure email even when Telegram cannot deliver messages.
+- **S3 credentials are not backed up** (the `credentials` table is created by the dump, but its rows are removed). After a restore, create new keys in the Mini App **Keys** tab.
+- On failure or cancellation every admin in `TG_ADMIN_IDS` also gets the Telegram message `tg-s3 daily D1 backup / bot health check failed: <run URL>` (best effort).
+- **Accepting a deliberate large deletion**: delete the counts file, then run the workflow manually; that run is treated as a first run.
+
+  ```bash
+  npx wrangler r2 object delete tg-s3-self-backup/d1/last-count.json --remote
+  ```
+
+- GitHub pauses scheduled workflows in a repository with no activity for 60 days. Re-enable **D1 backup** in the **Actions** tab (or push a commit) if that happens; Time Travel keeps working meanwhile.
+
+### Restore after the database is gone
+
+Use this only when the database was deleted or Time Travel no longer reaches back far enough. A snapshot must be restored into an **empty** database.
+
+1. Set the GitHub Variable `WEB_UPLOAD_BUCKET` to `off`, so the public page stays off until you have checked the result, and **do not push to `main` or run the deploy workflow** until step 6: on a missing database it creates a new one and applies every migration, so it is no longer empty.
+2. Create an empty database and note its ID:
+
+   ```bash
+   export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
+   npx wrangler d1 create tg-s3-self-db
+   ```
+
+   Put the new ID into `database_id` in your local `wrangler.toml` for the next commands (do not commit it).
+3. Download a snapshot from before the problem, for example Monday's:
+
+   ```bash
+   npx wrangler r2 object get tg-s3-self-backup/d1/Mon.sql --remote --file backup.sql
+   ```
+
+4. Load it, then apply only the migrations that are newer than the snapshot:
+
+   ```bash
+   npx wrangler d1 execute tg-s3-self-db --remote --file backup.sql
+   npx wrangler d1 migrations apply tg-s3-self-db --remote
+   ```
+
+5. Check the counts, then delete the local file (it contains chat IDs, object keys and share tokens) and revert `database_id` to `""`:
+
+   ```bash
+   npx wrangler d1 execute tg-s3-self-db --remote --command "SELECT (SELECT count(*) FROM objects) AS objects, (SELECT count(*) FROM buckets) AS buckets"
+   rm backup.sql
+   ```
+
+6. Re-run **Deploy to Cloudflare Workers**: it finds the new database by name and binds the Worker to it (the migrations are already applied).
+7. Create new S3 keys in the Mini App and update your clients. When everything works, set `WEB_UPLOAD_BUCKET` back (or delete the Variable) and re-run the workflow.
 
 ## Local development
 
@@ -320,4 +435,4 @@ rclone config create tgs3 s3 provider=Other \
 rclone ls tgs3:test
 ```
 
-Replace `https://files.example.com` with your Worker URL. Live logs: `npx wrangler tail tg-s3-self`. S3 compatibility details: [S3-COMPAT.md](S3-COMPAT.md).
+Replace `https://files.example.com` with your Worker URL. Live logs: `npx wrangler tail tg-s3-self`; persisted Worker logs (cron results and errors, no per-request logs) are in the dashboard under the Worker's **Logs**. S3 compatibility details: [S3-COMPAT.md](S3-COMPAT.md).

@@ -6,7 +6,7 @@ The Worker serves a simple drag-and-drop upload page at `/`. Anyone who opens it
 
 > [!WARNING]
 > **Web upload is enabled by default and is public.**
-> 1. **Anyone who knows your Worker URL can upload files** (≤ 20 MB each) and get public links. The Worker has **no login and no rate limit** for this page. It can be abused (spam, illegal content), which may get your Telegram bot or group banned.
+> 1. **Anyone who knows your Worker URL can upload files** (≤ 20 MB each) and get public links. There is **no login** for this page; the only built-in limit is 30 uploads per minute per client IP ([details](#built-in-rate-limit)), which is easily bypassed from many IPs and is **not** a protection. It can be abused (spam, illegal content), which may get your Telegram bot or group banned.
 > 2. **Protect it with Cloudflare**: a [WAF rate limiting rule](#option-1-waf-rate-limiting-rule) and/or [Cloudflare Access](#option-2-cloudflare-access). Both require a **custom domain** on a Cloudflare zone — they do not protect the `*.workers.dev` URL, so that URL must be turned off.
 > 3. **Or disable it**: set the GitHub Variable `WEB_UPLOAD_BUCKET` to `off` and re-run the workflow (with `deploy.sh`: set `WEB_UPLOAD_BUCKET = "off"` in `wrangler.toml`).
 
@@ -17,7 +17,7 @@ The Worker serves a simple drag-and-drop upload page at `/`. Anyone who opens it
 | Routes | `GET /` (also `/index.html`) — the upload page; `POST /api/web-upload?name=<filename>` — the upload endpoint (raw file in the request body). The page is served only to unauthenticated requests: a signed S3 request to `/` (ListBuckets, e.g. `aws s3 ls`) or a presigned URL still reaches the S3 API |
 | Default | **ON**: `WEB_UPLOAD_BUCKET = "files"` in `wrangler.toml` |
 | Size limit | 20 MB, checked on the `Content-Length` header and on the bytes actually received (`413` if larger) |
-| Authentication | None. No built-in rate limit |
+| Authentication | None. Per-client rate limit of 30 requests per 60 s, see [Built-in rate limit](#built-in-rate-limit) |
 | Bucket | Value of `WEB_UPLOAD_BUCKET` (lower-cased). It must be a valid bucket name (`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` after lower-casing), otherwise uploads fail with `500`. If the bucket does not exist, it is created on the first upload as a **public** bucket in `DEFAULT_CHAT_ID` (one atomic insert, so concurrent first uploads cannot create it twice) |
 | Existing private bucket | Never made public. Uploads fail with `403` (`Web upload bucket is private; make it public or set WEB_UPLOAD_BUCKET=off`) |
 | Object key | `YYYYMMDD_<sanitized-name>_<4 random hex>.<ext>`, e.g. `20261009_holiday_photo_3f9a.jpg`. The extension is sanitized like the name (only `a-z`, `0-9`, `.`, `-` are kept) |
@@ -25,6 +25,30 @@ The Worker serves a simple drag-and-drop upload page at `/`. Anyone who opens it
 | Returned link | `https://<worker-host>/<bucket>/<key>` — readable by anyone, because the bucket is public |
 
 The uploaded files are normal objects: you can also see and delete them with the bot, the Mini App or any S3 client.
+
+## Built-in rate limit
+
+`POST /api/web-upload` goes through the Workers Rate Limiting binding `WEB_UPLOAD_LIMITER` (`[[ratelimits]]` in `wrangler.toml`):
+
+| Item | Behavior |
+|------|----------|
+| Limit | 30 requests per 60 seconds per client |
+| Client key | The IPv4 address, or the IPv6 **/64** network (one IPv6 user usually owns a whole /64) |
+| When exceeded | `429` with `Retry-After: 60`, returned before the request body is read |
+| Upload page | On `429` the page shows `Rate limited, waiting Ns…`, waits, and re-sends the same file, up to 3 times |
+
+This is **damping only**, not protection. The counter is kept per Cloudflare location and is eventually consistent, so a few extra requests can get through, and an attacker with many IP addresses is not stopped at all. If the limiter itself fails, the upload is allowed (fails open). To really protect the page, turn it off or use [Cloudflare Access](#option-2-cloudflare-access) on a custom domain.
+
+To change the limit, edit `limit` and/or `period` in `wrangler.toml` and re-deploy (`period` must be `10` or `60`):
+
+```toml
+[[ratelimits]]
+name = "WEB_UPLOAD_LIMITER"
+namespace_id = "73201"
+simple = { limit = 30, period = 60 }
+```
+
+`namespace_id` is account-wide: keep it unique among your Workers, otherwise they share the same counters.
 
 ## Turning it off or changing the bucket
 

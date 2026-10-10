@@ -85,7 +85,7 @@ If something fails, see the troubleshooting section of the [deployment guide](do
 ## Security warning
 
 > [!WARNING]
-> 1. **Web upload is enabled by default.** Anyone who knows your Worker URL can upload files (up to 20 MB each) through the page at `/` and get public links, without logging in. The Worker has **no built-in rate limit** for this. It can be abused (spam, illegal content) and may get your Telegram bot or group banned.
+> 1. **Web upload is enabled by default.** Anyone who knows your Worker URL can upload files (up to 20 MB each) through the page at `/` and get public links, without logging in. The only built-in limit is **30 uploads per minute per client IP** (IPv6: per /64 network), counted per Cloudflare location. It only slows down a single abuser and is easily bypassed from many IPs, so it is **not** a protection. The page can be abused (spam, illegal content) and may get your Telegram bot or group banned. Real protection means turning it off or putting Cloudflare Access in front of it on a custom domain.
 > 2. **Protect it with Cloudflare**, using a **custom domain** on a Cloudflare zone (WAF rules and Access do not apply to `*.workers.dev`):
 >    - a **WAF rate limiting rule** on path `/api/web-upload` (e.g. more than 5 requests per 10 seconds per IP → Block; available on the Free plan, see [Cloudflare docs](https://developers.cloudflare.com/waf/rate-limiting-rules/)), and/or
 >    - **Cloudflare Access** (Zero Trust) on `/api/web-upload` only, so only allowed emails can upload. Never put Access in front of `/bot/webhook`, S3 paths or `/share/*`.
@@ -93,6 +93,16 @@ If something fails, see the troubleshooting section of the [deployment guide](do
 >
 >    Step-by-step dashboard instructions: [docs/web-upload.md](docs/web-upload.md).
 > 3. **Or disable it:** set the GitHub Variable `WEB_UPLOAD_BUCKET` to `off` and re-run the workflow.
+
+## Reliability
+
+With the GitHub Actions deploy (Path A) you also get:
+
+- **A safe cron job**: every 6 hours the Worker checks a few files on Telegram. It never deletes anything because of a Telegram error; problems (lost files, wrong or revoked bot token, Telegram outage) are sent as a Telegram message to every user in `TG_ADMIN_IDS` (each admin must `/start` the bot once).
+- **Webhook self-heal**: if the Telegram webhook disappears, the cron job registers it again.
+- **Daily D1 backup** to the R2 bucket `tg-s3-self-backup`, with a guard that refuses to overwrite good backups with an empty or shrunken database. A failed backup sends a GitHub failure email and a Telegram message.
+
+Details and the restore procedure: [deployment guide → Backups and restore](docs/deployment.md#backups-and-restore). The `deploy.sh` path gets the cron alerts and webhook self-heal, but not the scheduled backup.
 
 ## Architecture
 
@@ -120,7 +130,7 @@ flowchart LR
 
 ## Alternative: local deploy with deploy.sh
 
-Use this path to deploy from your own machine, or to run the optional VPS processor (Docker) for files larger than 20 MB via the Telegram Local Bot API. Requirements: Node.js 22+, and Docker for the VPS stack.
+Use this path to deploy from your own machine, or to run the optional VPS processor (Docker) for files larger than 20 MB via the Telegram Local Bot API. Requirements: Node.js 22.18+, and Docker for the VPS stack.
 
 ```bash
 # in your fork's clone
@@ -215,7 +225,7 @@ Send a file to the bot to upload it to your default bucket (set with `/setbucket
 
 ## Documentation
 
-- [Deployment guide](docs/deployment.md): GitHub Actions, `deploy.sh`, custom domain, troubleshooting
+- [Deployment guide](docs/deployment.md): GitHub Actions, `deploy.sh`, custom domain, alerts, backups and restore, troubleshooting
 - [Configuration reference](docs/configuration.md): every variable and where to set it
 - [Web upload](docs/web-upload.md): behavior, disabling, Cloudflare WAF / Access protection
 - [Bot commands](docs/bot-commands.md)
@@ -241,7 +251,7 @@ npm run typecheck
 - **Auth:** AWS SigV4, presigned URLs, Bearer tokens
 - **Language:** TypeScript (strict mode)
 - **Media processing:** Sharp + FFmpeg (VPS only)
-- **Tooling:** wrangler v4, Node.js 22+ (CI uses Node.js 24)
+- **Tooling:** wrangler v4, Node.js 22.18+ (CI uses Node.js 24)
 
 ## Credits
 

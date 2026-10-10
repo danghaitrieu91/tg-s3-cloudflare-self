@@ -22,8 +22,8 @@ These are the fields of the `Env` interface in `src/types.ts` plus `WEB_UPLOAD_B
 |------|----------|---------|--------|--------|
 | `TG_BOT_TOKEN` | Yes | Telegram bot token from @BotFather. Also used to derive the webhook secret | Secret | `.env` |
 | `DEFAULT_CHAT_ID` | Yes | Supergroup chat ID (`-100…`) where files are stored. The bot must be an admin there | Secret | `.env` |
-| `TG_ADMIN_IDS` | Yes (enforced by CI and `deploy.sh`) | Comma-separated Telegram user IDs allowed to use the bot **and** the Mini App API (initData / Bearer auth), e.g. `123456789,987654321`. If the Worker runs without it, **any** Telegram user can use the bot and any Telegram user who opens the Mini App is accepted | Secret | `.env` |
-| `WORKER_URL` | Automatic | Public URL of the Worker. Used for share links sent by the bot and for CDN cache purging in the cron job. Do not set it yourself | Set by CI (`https://<CUSTOM_DOMAIN>` or the `*.workers.dev` URL) | Set by `deploy.sh` (`https://<CF_CUSTOM_DOMAIN>` or the `*.workers.dev` URL) |
+| `TG_ADMIN_IDS` | Yes (enforced by CI and `deploy.sh`) | Comma-separated Telegram user IDs allowed to use the bot **and** the Mini App API (initData / Bearer auth), e.g. `123456789,987654321`. If the Worker runs without it, **any** Telegram user can use the bot and any Telegram user who opens the Mini App is accepted. These users also receive the [cron alerts](#cron-maintenance-tasks) and backup failure messages; each must send `/start` to the bot once, otherwise Telegram refuses the messages | Secret | `.env` |
+| `WORKER_URL` | Automatic | Public URL of the Worker (a trailing slash is tolerated). Used for share links sent by the bot, for CDN cache purging in the cron job, for the webhook self-heal (the cron job re-registers `<WORKER_URL>/bot/webhook` when the webhook is missing) and as the reference host for cron alerts. If it is missing, the cron job cannot repair the webhook and sends an alert instead. Do not set it yourself | Set by CI (`https://<CUSTOM_DOMAIN>` or the `*.workers.dev` URL) | Set by `deploy.sh` (`https://<CF_CUSTOM_DOMAIN>` or the `*.workers.dev` URL) |
 | `SSE_MASTER_KEY` | No | Base64 32-byte key for SSE-S3 (server-managed encryption). Generate with `openssl rand -base64 32`. Without it, SSE-S3 requests are rejected. Keep it forever: objects encrypted with it cannot be read without it | Secret (optional) | Auto-generated into `.env` |
 | `VPS_URL` | No | Public HTTPS URL of the VPS processor (files > 20 MB, media processing) | Secret (optional) | `.env`; set automatically when `deploy.sh` creates the tunnel |
 | `VPS_SECRET` | No | Shared secret between the Worker and the processor (the processor reads it as `AUTH_SECRET`) | Secret (optional; must match the processor) | Auto-generated into `.env` |
@@ -31,6 +31,7 @@ These are the fields of the `Env` interface in `src/types.ts` plus `WEB_UPLOAD_B
 | `WEB_UPLOAD_BUCKET` | No (default `files`) | Bucket used by the public web upload page. `off` (any case) or empty disables the page and `POST /api/web-upload`. Any other value must be a valid bucket name (`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` after lower-casing), otherwise uploads fail with `500`. See [web-upload.md](web-upload.md) | Variable; unset = value in `wrangler.toml` (`files`) | `wrangler.toml` `[vars]` only — **`deploy.sh` ignores `WEB_UPLOAD_BUCKET` in `.env`** |
 | `DB` | Yes (binding) | D1 database `tg-s3-self-db` (metadata) | `wrangler.toml` `[[d1_databases]]`; `database_id` filled by CI | same; `database_id` filled by `deploy.sh` |
 | `CACHE` | No (binding) | R2 bucket `tg-s3-self-cache` (hot-file cache, files ≤ 20 MB) | `wrangler.toml` `[[r2_buckets]]`; bucket created by CI | same; created by `deploy.sh` with a 90-day lifecycle rule |
+| `WEB_UPLOAD_LIMITER` | No (binding) | Workers Rate Limiting binding for `POST /api/web-upload`: 30 requests per 60 s per client (IPv4 address or IPv6 /64). Damping only; if the limiter itself errors, the upload is allowed (fails open). See [web-upload.md → Built-in rate limit](web-upload.md#built-in-rate-limit) | `wrangler.toml` `[[ratelimits]]` | same |
 
 To find your Telegram user ID, send any message to [@userinfobot](https://t.me/userinfobot).
 
@@ -43,6 +44,18 @@ To find your Telegram user ID, send any message to [@userinfobot](https://t.me/u
 | `DEPLOY_ENABLED` | Variable | Yes | Must be exactly `true`; otherwise the deploy job is skipped |
 | `CUSTOM_DOMAIN` | Variable | No | Bare hostname in a zone on the same Cloudflare account, e.g. `files.example.com` (no `https://`, no path). CI adds a Custom Domain route and sets `workers_dev = false` (CI workspace only). Use a dedicated, unused hostname: an existing DNS record or Custom Domain on it is re-pointed to this Worker ([deployment.md](deployment.md#custom-domain)) |
 | `WEB_UPLOAD_BUCKET` | Variable | No | Overrides `wrangler.toml` at deploy time (`--var`). See [Worker settings](#worker-settings) |
+
+### Backup workflow
+
+`.github/workflows/backup.yml` runs daily at 03:17 UTC and on manual runs, only when `DEPLOY_ENABLED` is `true` (job timeout 20 minutes). It uses the same Secrets as the deploy workflow (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `TG_BOT_TOKEN`, `TG_ADMIN_IDS`) and needs no extra configuration. It exports D1 with `scripts/d1-backup.sh` into the R2 bucket `tg-s3-self-backup` (created on the first run):
+
+| Key | Content |
+|-----|---------|
+| `d1/<Mon..Sun>.sql` | Rolling 7-day snapshots (one per weekday, overwritten a week later) |
+| `d1/monthly/<YYYY-MM>.sql` | Monthly snapshots (the latest run of the month) |
+| `d1/last-count.json` | Object and bucket counts of the last good backup, used by the shrink guard |
+
+Each snapshot is one full `wrangler d1 export` (schema and data of every table, including `d1_migrations`) with the `credentials` rows removed (S3 secrets are not backed up). New tables are included automatically. Before upload, the dump is restored into a scratch local D1 on the runner; the counts in `d1/last-count.json` come from that restore. Guard, restore and failure handling: [deployment.md → Backups and restore](deployment.md#backups-and-restore).
 
 ## `deploy.sh` / `.env` only
 
@@ -96,24 +109,39 @@ bucket_name = "tg-s3-self-cache"
 
 [triggers]
 crons = ["0 */6 * * *"]
+
+[[ratelimits]]
+name = "WEB_UPLOAD_LIMITER"
+namespace_id = "73201"
+simple = { limit = 30, period = 60 }
+
+[observability]
+enabled = true
+
+[observability.logs]
+invocation_logs = false
 ```
 
 - Keep `database_id = ""` in the repository; CI fills it in its own workspace. Never put a comment on the `database_id` line: `deploy.sh` parses that line.
 - There is no `[[routes]]` section by default. Path A adds one when `CUSTOM_DOMAIN` is set; for Path B add it yourself (see [deployment.md](deployment.md#custom-domain-and-tunnel)).
 - The schema is managed by the SQL files in `migrations/` (`wrangler d1 migrations apply`).
+- `[[ratelimits]]` sets the web upload limit; change `limit` (and `period`, `10` or `60`) and re-deploy. `namespace_id` is account-wide: keep it unique among your Workers so they do not share counters. See [web-upload.md](web-upload.md#built-in-rate-limit).
+- `[observability]` turns on Workers Logs, so `console.*` output (cron results, errors) is kept and searchable in the dashboard. `invocation_logs = false` stops Cloudflare from storing one log per request, because request URLs can contain Mini App `auth=` tokens and share passwords. Use `npx wrangler tail tg-s3-self` for live request debugging.
 
 ### Cron maintenance tasks
 
 The scheduled handler runs every 6 hours and:
 
-1. Cleans expired share tokens.
-2. Cleans orphaned share tokens (object deleted but share remains).
-3. Cleans stale multipart uploads (> 24 hours).
-4. Cleans orphaned chunks.
-5. Cleans expired password attempt records.
-6. Runs a consistency check (a sample of ~2% of objects, clamped to 5–50, verifying Telegram file access).
-7. Cleans the R2 cache (evicts objects deleted from D1).
-8. Applies bucket lifecycle rules (deletes expired objects).
+1. Checks the Telegram webhook: if it is missing it is registered again at `<WORKER_URL>/bot/webhook`; if it points to another host or reported an error in the last 6 hours, an alert is sent (nothing is changed); if `WORKER_URL` is not set, an alert is sent.
+2. Checks Telegram file access (report-only): calls `getFile` for a sample of ~2% of objects, clamped to 5–12 per run, only objects ≤ 20 MB, within 120 seconds. It **never deletes** anything. Files Telegram reports as gone, an invalid or revoked token, a token that belongs to a different bot, or a Telegram outage are reported as alerts.
+3. Sends the alerts from steps 1–2 as a Telegram message to every user in `TG_ADMIN_IDS`. If there were alerts but none could be delivered, the run ends with the error `cron alerts undelivered` (visible in the dashboard under the Worker's Cron Events).
+4. Cleans expired share tokens.
+5. Cleans orphaned share tokens (object deleted but share remains).
+6. Cleans stale multipart uploads (> 24 hours).
+7. Cleans orphaned chunks.
+8. Cleans expired password attempt records.
+9. Cleans the R2 cache (evicts objects deleted from D1).
+10. Applies bucket lifecycle rules (deletes expired objects).
 
 ## Security notes
 

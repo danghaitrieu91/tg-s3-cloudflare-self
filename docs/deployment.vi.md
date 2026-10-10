@@ -25,11 +25,11 @@ Toàn bộ tuỳ chọn cấu hình nằm trong [configuration.vi.md](configurat
 2. **Telegram supergroup** — tạo một nhóm, thêm bot làm **quản trị viên (admin)** và lấy chat ID của nhóm (số âm bắt đầu bằng `-100`, ví dụ `-1001234567890`). Cách lấy: tạm thêm [@userinfobot](https://t.me/userinfobot) vào nhóm, hoặc gửi một tin nhắn trong nhóm rồi mở `https://api.telegram.org/bot<TOKEN>/getUpdates` và tìm `chat.id`.
 3. **User ID Telegram của bạn** — gửi một tin nhắn bất kỳ cho [@userinfobot](https://t.me/userinfobot). Giá trị này dùng cho `TG_ADMIN_IDS` (bắt buộc).
 4. **Tài khoản Cloudflare** đã **kích hoạt R2** — R2 cần đăng ký (subscription) kể cả khi chỉ dùng hạn mức miễn phí: dashboard → **Storage & databases → R2 → Overview** → hoàn tất bước checkout. Nguồn: [R2 get started](https://developers.cloudflare.com/r2/get-started/).
-5. Chỉ cho cách B / phát triển local: **Node.js 22+** (dự án dùng wrangler v4).
+5. Chỉ cho cách B / phát triển local: **Node.js 22.18+** (dự án dùng wrangler v4; `npm test` cần tính năng tự lược bỏ kiểu TypeScript (type stripping) có sẵn trong Node).
 
 ## Cách A: GitHub Actions
 
-Workflow nằm ở `.github/workflows/deploy.yml`. Nó chạy mỗi khi push lên `main` và khi chạy tay, nhưng job sẽ bị **bỏ qua (skipped)** cho đến khi bạn đặt Variable `DEPLOY_ENABLED` của repo thành `true`.
+Workflow nằm ở `.github/workflows/deploy.yml`. Nó chạy mỗi khi push lên `main` và khi chạy tay, nhưng job deploy sẽ bị **bỏ qua (skipped)** cho đến khi bạn đặt Variable `DEPLOY_ENABLED` của repo thành `true`. Một job `test` riêng (kiểm tra kiểu và unit test, không dùng secret nào) chạy trước ở mọi lần push và mọi pull request, kể cả trên fork; job deploy chỉ bắt đầu khi job này thành công và không bao giờ chạy cho pull request.
 
 > [!NOTE]
 > Workflow chưa được tác giả template chạy thử trọn vẹn; lần chạy đầu tiên trên fork của bạn chính là lần kiểm tra thật. Nếu có bước lỗi, xem [Khắc phục sự cố (cách A)](#khắc-phục-sự-cố-cách-a).
@@ -107,14 +107,17 @@ Cùng trang, tab **Variables** → **New repository variable**.
 
 | Bước | Diễn giải |
 |------|-----------|
+| Test (job `test`) | `npm ci`, `npm run typecheck`, `npm test`. Chạy khi push và khi có pull request, không cần secret; nếu lỗi thì không deploy |
 | Validate required secrets | Báo lỗi `Missing required repository secret: <NAME>` nếu một trong các secret `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `TG_BOT_TOKEN`, `DEFAULT_CHAT_ID`, `TG_ADMIN_IDS` bị trống, và báo `Variable CUSTOM_DOMAIN must be a bare hostname …` nếu `CUSTOM_DOMAIN` không phải hostname trần |
 | Ensure D1 database | Tìm `tg-s3-self-db` (`wrangler d1 list --json`), tạo mới nếu chưa có, rồi ghi ID vào `wrangler.toml` **chỉ trong workspace của CI** (không bao giờ commit). Báo lỗi `wrangler d1 list failed …` nếu chính bước tìm kiếm thất bại |
 | Ensure R2 cache bucket | Tạo `tg-s3-self-cache`; lỗi "already exists" được coi là thành công |
 | Configure custom domain | Chỉ khi có `CUSTOM_DOMAIN`: thêm `[[routes]] pattern = "<domain>" custom_domain = true` và đặt `workers_dev = false` (chỉ trong workspace) |
+| D1 bookmark | In thông báo (notice) `D1 bookmark before migrations: <id>` trong phần tóm tắt của lần chạy: một điểm khôi phục D1 Time Travel được lấy trước khi chạy migration (xem [Sao lưu và khôi phục](#sao-lưu-và-khôi-phục)). Với database mới tinh thì chỉ là cảnh báo |
 | Apply D1 migrations | `wrangler d1 migrations apply tg-s3-self-db --remote` |
 | Deploy Worker | `wrangler deploy --secrets-file …`: secrets được tải lên cùng lúc với mã nguồn. Chỉ thêm `--var WEB_UPLOAD_BUCKET:<giá-trị>` khi Variable được đặt. In ra thông báo web upload đang BẬT hay TẮT |
 | Resolve Worker URL | `https://<CUSTOM_DOMAIN>`, hoặc URL `*.workers.dev` lấy từ output của lệnh deploy, sau đó lưu thành secret `WORKER_URL` |
 | Register Telegram webhook | Gọi `setWebhook` với `<WORKER_URL>/bot/webhook` và secret token suy ra từ bot token (HMAC-SHA256). Job thất bại nếu Telegram không trả về `ok` |
+| Smoke test | Gửi request không xác thực tới `<WORKER_URL>/tgs3-smoke-nonexistent/x` (tối đa 12 lần, cách nhau 10 giây) và chờ mã `403` kèm body lỗi S3 của Worker `<Code>AccessDenied</Code>`, chứng tỏ phiên bản mới đọc được D1 và chạy qua bước xác thực S3. Mã `403` do lớp edge (WAF, Access) trả về không được tính. Mọi kết quả khác làm job thất bại |
 
 ### Tên miền riêng
 
@@ -134,6 +137,7 @@ CI cũng đặt `workers_dev = false`, nên từ lần triển khai đó URL `*.
 - Migration D1 được áp dụng ở mỗi lần chạy; migration đã áp dụng sẽ được bỏ qua.
 - Giữ nguyên `database_id = ""` trong `wrangler.toml` khi commit; CI tự điền trong workspace của nó.
 - Xoá một Secret tuỳ chọn (ví dụ `VPS_URL` hoặc `SSE_MASTER_KEY`) khỏi GitHub **không** xoá nó khỏi Worker: các lần deploy giữ nguyên secret đã lưu trên Worker. Hãy xoá cả trên Worker bằng `npx wrangler secret delete <NAME> --name tg-s3-self`.
+- Pull request (kể cả từ fork) chỉ chạy job `test`; không có gì được deploy cho tới khi thay đổi vào `main`.
 
 ### Khắc phục sự cố (cách A)
 
@@ -152,6 +156,12 @@ CI cũng đặt `workers_dev = false`, nên từ lần triển khai đó URL `*.
 | `Could not reach api.telegram.org` | Lỗi mạng từ runner; chạy lại job |
 | Lỗi tên miền riêng khi deploy | Zone không cùng tài khoản, hoặc token thiếu quyền Zone |
 | Bot không trả lời | Nhắn với bot trong **chat riêng**; kiểm tra user ID của bạn có trong `TG_ADMIN_IDS`; kiểm tra `getWebhookInfo` (xem [Kiểm tra sau triển khai](#kiểm-tra-sau-triển-khai)) |
+| `Smoke test failed (HTTP <code>, expected 403 AccessDenied from the Worker)` | Phiên bản mới **đã chạy thật** nhưng trả lời sai. `403-unexpected` là 403 không có body `AccessDenied` của Worker: một rule WAF hoặc Cloudflare Access đang chặn đường dẫn, hãy cho phép các đường dẫn S3. `500` thường là lỗi D1 hoặc migration; `000`, `404` hay `52x` thường là URL chưa phục vụ được (tên miền riêng mới có thể cần vài phút — chạy lại workflow). Xem `npx wrangler tail tg-s3-self`, rồi sửa và push, hoặc quay lại mã cũ bằng `npx wrangler rollback --name tg-s3-self`. Nếu migration làm hỏng dữ liệu, khôi phục D1 về bookmark mà chính lần chạy đó in ra ([Sao lưu và khôi phục](#sao-lưu-và-khôi-phục)) |
+| D1 backup: `getMe failed: … (TG_BOT_TOKEN invalid or revoked?)` | Bản sao lưu đã chạy xong (bước kiểm tra này chạy sau khi tải lên, kể cả khi một bước trước đó lỗi), nhưng Telegram từ chối bot token, nên bot đã chết và cũng không gửi được cảnh báo. Nếu token bị thu hồi, lấy token mới từ @BotFather, cập nhật Secret `TG_BOT_TOKEN`, chạy lại **Deploy to Cloudflare Workers** (tải token lên và đăng ký lại webhook), rồi chạy lại **D1 backup** |
+| D1 backup: `No Telegram webhook is set; …` | Bản sao lưu đã chạy xong, nhưng bot không nhận được tin nhắn. Lần chạy cron kế tiếp (mỗi 6 giờ) sẽ đăng ký lại webhook nếu có `WORKER_URL`; muốn sửa ngay thì chạy lại **Deploy to Cloudflare Workers** |
+| D1 backup: `D1 database tg-s3-self-db not found; not creating it` | Job sao lưu không bao giờ tạo database, để không sao lưu một database trống thay thế đè lên bản sao lưu tốt. Kiểm tra `CLOUDFLARE_ACCOUNT_ID` có đúng tài khoản không. Nếu database thật sự đã mất, làm theo [Khôi phục khi database đã mất](#khôi-phục-khi-database-đã-mất) |
+| D1 backup: `Could not read d1/last-count.json from tg-s3-self-backup; refusing to run without the shrink guard` | Đọc số liệu lần trước thất bại vì lý do khác với "key không tồn tại" (mạng, quyền). Job dừng lại thay vì chạy mà không có cơ chế chặn. Kiểm tra token có quyền **Workers R2 Storage: Edit**, rồi chạy lại **D1 backup** |
+| D1 backup: `refusing to overwrite backups: objects N -> M` | Số object trong bản dump đã kiểm tra giảm về 0 hoặc dưới một nửa so với lần sao lưu tốt gần nhất. Không có gì được tải lên; các bản sao lưu cũ còn nguyên. Nếu điều này bất thường, hãy điều tra và khôi phục ([Sao lưu và khôi phục](#sao-lưu-và-khôi-phục)). Nếu bạn cố ý xoá các file đó, chấp nhận số mới như trong [Sao lưu hằng ngày](#sao-lưu-hằng-ngày-github-actions) |
 
 ## Cách B: `deploy.sh`
 
@@ -263,6 +273,14 @@ git pull
 ./deploy.sh          # hoặc ./deploy.sh --vps
 ```
 
+Các image của bên thứ ba (`aiogram/telegram-bot-api`, `cloudflare/cloudflared`) không được ghim phiên bản và chỉ được tải về một lần: `deploy.sh` không bao giờ tải lại, nên chạy lại script không nâng cấp chúng. Hãy chủ động nâng cấp trong thư mục chứa `docker-compose.yml` (trên server nếu dùng `--vps`), rồi kiểm tra log sau đó:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Các dịch vụ này nằm sau profile của Compose, nên hãy thêm các profile bạn đang chạy vào cả hai lệnh, ví dụ `docker compose --profile tunnel --profile localapi pull && docker compose --profile tunnel --profile localapi up -d`.
+
 Lệnh Docker hữu ích: `docker compose --profile tunnel logs -f`, `docker compose --profile tunnel restart`, `docker compose --profile tunnel down`.
 
 ### Khắc phục sự cố (cách B)
@@ -277,6 +295,103 @@ Lệnh Docker hữu ích: `docker compose --profile tunnel logs -f`, `docker com
 | Không tạo được tunnel / processor "không truy cập được từ bên ngoài" | Đặt `CF_CUSTOM_DOMAIN`, thêm quyền **Cloudflare Tunnel: Edit** và **DNS: Edit** cho token rồi chạy lại; hoặc tự đặt `CF_TUNNEL_TOKEN` + `VPS_URL` |
 | Processor gặp lỗi | `docker compose logs processor` (với `--vps`, trên server: `ssh <VPS_SSH> 'cd /opt/tg-s3-self && docker compose logs'`) |
 | Lỗi SSH ở chế độ `--vps` | SSH bằng key phải chạy được không cần tương tác: `ssh -o BatchMode=yes <VPS_SSH> echo ok` |
+
+## Cảnh báo
+
+Cron của Worker (mỗi 6 giờ, cả hai cách) gửi một tin nhắn Telegram có tiêu đề **tg-s3 cron** tới mọi người dùng trong `TG_ADMIN_IDS` khi có việc cần xử lý. Mỗi admin phải gửi `/start` cho bot một lần, nếu không Telegram sẽ từ chối gửi tin. Cron không bao giờ xoá object vì lỗi từ Telegram. Chi tiết từng bước: [configuration.vi.md → Tác vụ bảo trì định kỳ](configuration.vi.md#tác-vụ-bảo-trì-định-kỳ-cron).
+
+| Cảnh báo | Ý nghĩa và cách xử lý |
+|----------|-----------------------|
+| `getFile 400 for N of M sampled (lost, or not readable by this bot). Nothing was deleted.` + tối đa 10 key | Telegram không còn phục vụ các file này (ví dụ tin nhắn đã bị xoá khỏi nhóm lưu trữ). Kiểm tra nhóm; nếu file thật sự mất, tự xoá các object được liệt kê (lệnh bot `/delete`, Mini App hoặc S3) |
+| `All probes returned 400: TG_BOT_TOKEN is valid but probably belongs to a different bot …` | File ID chỉ dùng được với bot đã tải file lên. Có lẽ `TG_BOT_TOKEN` đã bị thay bằng token của bot khác: đặt lại token của bot ban đầu rồi deploy lại |
+| `getFile returned 401 … TG_BOT_TOKEN invalid or revoked.` | Tạo token mới cho chính bot đó trong @BotFather, cập nhật Secret (hoặc `.env`) rồi deploy lại |
+| `Telegram unreachable or degraded: …` | Ít nhất một nửa số lần kiểm tra lỗi tạm thời. Thường tự hết; chỉ cần xử lý nếu lặp lại |
+| `Webhook was missing → re-registered.` | Chỉ để thông báo: webhook bị trống và cron đã đặt lại |
+| `Webhook re-register FAILED …`, `Webhook: getWebhookInfo failed …` | Telegram từ chối hoặc không trả lời. Chạy lại deploy (workflow cách A hoặc `./deploy.sh`) |
+| `Webhook points to another host (…); not changed.` | Một bản triển khai khác (hoặc một lệnh `setWebhook` thủ công) đã chiếm bot. Cron không giành lại; hãy deploy lại bản này nếu nó là bản phải sở hữu bot |
+| `Webhook error: …` | Telegram báo lỗi gửi webhook trong 6 giờ qua. Kiểm tra URL Worker còn hoạt động, rồi xem [Kiểm tra sau triển khai](#kiểm-tra-sau-triển-khai) |
+| `WORKER_URL not set: webhook self-heal disabled.` | Deploy lại để CI hoặc `deploy.sh` đặt `WORKER_URL` |
+
+Nếu có cảnh báo mà không gửi được cho ai (chưa admin nào `/start` bot, hoặc token đã bị thu hồi), lần chạy cron kết thúc với lỗi `cron alerts undelivered`, xem được trong dashboard Cloudflare ở mục **Cron Events** của Worker. Token bị thu hồi thì không gửi được tin Telegram nào, nên với GitHub Actions, [job sao lưu hằng ngày](#sao-lưu-hằng-ngày-github-actions) là kênh dự phòng: sau khi sao lưu, nó kiểm tra token bằng `getMe` và thất bại, khiến GitHub gửi email báo workflow lỗi. Hãy giữ bật email thông báo của GitHub.
+
+## Sao lưu và khôi phục
+
+Có hai lớp bảo vệ metadata D1 (bản thân file vẫn nằm trên Telegram, nhưng thiếu D1 thì không tìm lại được):
+
+| Lớp | Nội dung | Nơi lưu |
+|-----|----------|---------|
+| D1 Time Travel | Khôi phục về một thời điểm, có sẵn trong D1, chừng nào database còn tồn tại (thời gian lưu: 7 ngày với Workers Free, 30 ngày với Workers Paid) | Cloudflare |
+| Bản xuất hằng ngày (chỉ cách A) | `.github/workflows/backup.yml`: mỗi ngày một bản SQL đầy đủ | Bucket R2 `tg-s3-self-backup` |
+
+`deploy.sh` (cách B) không có sao lưu định kỳ; Time Travel vẫn áp dụng.
+
+### Time Travel (lựa chọn đầu tiên)
+
+Dùng khi database vẫn còn nhưng nội dung bị sai (migration lỗi, lỡ xoá hàng loạt). Mỗi lần deploy đều in ra một điểm khôi phục lấy trước khi chạy migration: mở phần tóm tắt của lần chạy **Deploy to Cloudflare Workers** và tìm thông báo `D1 bookmark before migrations: <id>`.
+
+```bash
+export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
+# khôi phục về bookmark mà một lần deploy đã in ra
+npx wrangler d1 time-travel restore tg-s3-self-db --bookmark=<id>
+# hoặc tìm bookmark của một thời điểm, rồi khôi phục về bookmark đó
+npx wrangler d1 time-travel info tg-s3-self-db --timestamp=2026-10-09T12:00:00Z
+```
+
+Khôi phục sẽ thay toàn bộ database tại chỗ; wrangler in ra bookmark của trạng thái trước khi khôi phục, nên có thể hoàn tác theo cùng cách. Xem [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+
+### Sao lưu hằng ngày (GitHub Actions)
+
+- Chạy hằng ngày lúc 03:17 UTC và khi chạy tay (**Actions → D1 backup → Run workflow**), chỉ khi `DEPLOY_ENABLED` là `true`. Job tự dừng sau 20 phút.
+- Job chỉ tìm `tg-s3-self-db` ở chế độ chỉ đọc và **không bao giờ tạo mới**: nếu database không còn, job thất bại với `D1 database tg-s3-self-db not found; not creating it`.
+- Job xuất toàn bộ database bằng một lệnh `wrangler d1 export` (schema và dữ liệu của mọi bảng, kể cả `d1_migrations`, nên bảng mới được tự động đưa vào), rồi **kiểm tra** bản dump bằng cách khôi phục thử vào một D1 cục bộ tạm trên runner. Số liệu lưu trong `d1/last-count.json` lấy từ lần khôi phục thử đó.
+- Job từ chối ghi đè bản sao lưu tốt (`refusing to overwrite backups: objects N -> M`) khi số object sau khi khôi phục thử giảm về 0 hoặc dưới 50% so với lần chạy tốt gần nhất. Lần chạy đầu tiên (chưa có `d1/last-count.json`) chấp nhận mọi con số. Chỉ khi key không tồn tại mới được coi là lần đầu: mọi lỗi khác khi đọc file đếm đều làm job dừng (`Could not read d1/last-count.json …`).
+- Job tải lên `d1/<Mon..Sun>.sql` (xoay vòng 7 ngày) và `d1/monthly/<YYYY-MM>.sql`, rồi `d1/last-count.json` (bố cục: [configuration.vi.md → Workflow sao lưu](configuration.vi.md#workflow-sao-lưu)).
+- Sau khi tải lên, job kiểm tra bot bằng `getMe` và kiểm tra webhook đã được đặt. Bước này chạy cả khi một bước trước đó lỗi, và bot hỏng không chặn việc sao lưu, nhưng vẫn làm job thất bại, nên GitHub vẫn gửi email báo lỗi kể cả khi Telegram không gửi được tin.
+- **S3 credential không được sao lưu** (bản dump vẫn tạo bảng `credentials`, nhưng các dòng của nó đã bị bỏ). Sau khi khôi phục, hãy tạo key mới ở tab **Keys** của Mini App.
+- Khi thất bại hoặc bị huỷ, mọi admin trong `TG_ADMIN_IDS` cũng nhận tin nhắn Telegram `tg-s3 daily D1 backup / bot health check failed: <run URL>` (nếu gửi được).
+- **Chấp nhận một lần xoá lớn có chủ ý**: xoá file đếm, rồi chạy workflow bằng tay; lần chạy đó được coi như lần đầu.
+
+  ```bash
+  npx wrangler r2 object delete tg-s3-self-backup/d1/last-count.json --remote
+  ```
+
+- GitHub tạm dừng các workflow định kỳ trong repository không có hoạt động nào suốt 60 ngày. Nếu xảy ra, bật lại **D1 backup** trong tab **Actions** (hoặc push một commit); Time Travel vẫn hoạt động trong lúc đó.
+
+### Khôi phục khi database đã mất
+
+Chỉ dùng khi database đã bị xoá hoặc Time Travel không còn lùi đủ xa. Bản sao phải được khôi phục vào một database **trống**.
+
+1. Đặt GitHub Variable `WEB_UPLOAD_BUCKET` thành `off` để trang công khai vẫn tắt cho tới khi bạn kiểm tra xong, và **không push lên `main` hay chạy workflow deploy** cho tới bước 6: khi thiếu database, workflow sẽ tạo database mới và chạy mọi migration, nên database không còn trống nữa.
+2. Tạo một database trống và ghi lại ID:
+
+   ```bash
+   export CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=...
+   npx wrangler d1 create tg-s3-self-db
+   ```
+
+   Điền ID mới vào `database_id` trong `wrangler.toml` trên máy bạn để chạy các lệnh tiếp theo (đừng commit).
+3. Tải về một bản sao từ trước khi có sự cố, ví dụ của thứ Hai:
+
+   ```bash
+   npx wrangler r2 object get tg-s3-self-backup/d1/Mon.sql --remote --file backup.sql
+   ```
+
+4. Nạp bản sao, rồi chỉ áp dụng các migration mới hơn bản sao đó:
+
+   ```bash
+   npx wrangler d1 execute tg-s3-self-db --remote --file backup.sql
+   npx wrangler d1 migrations apply tg-s3-self-db --remote
+   ```
+
+5. Kiểm tra số lượng, rồi xoá file trên máy (nó chứa chat ID, key của object và share token) và đặt lại `database_id` thành `""`:
+
+   ```bash
+   npx wrangler d1 execute tg-s3-self-db --remote --command "SELECT (SELECT count(*) FROM objects) AS objects, (SELECT count(*) FROM buckets) AS buckets"
+   rm backup.sql
+   ```
+
+6. Chạy lại **Deploy to Cloudflare Workers**: workflow tìm database mới theo tên và gắn Worker vào đó (migration đã được áp dụng sẵn).
+7. Tạo S3 key mới trong Mini App và cập nhật các client. Khi mọi thứ đã ổn, đặt lại `WEB_UPLOAD_BUCKET` (hoặc xoá Variable) rồi chạy lại workflow.
 
 ## Phát triển local
 
@@ -320,4 +435,4 @@ rclone config create tgs3 s3 provider=Other \
 rclone ls tgs3:test
 ```
 
-Thay `https://files.example.com` bằng URL Worker của bạn. Xem log trực tiếp: `npx wrangler tail tg-s3-self`. Chi tiết tương thích S3 (tiếng Anh): [S3-COMPAT.md](S3-COMPAT.md).
+Thay `https://files.example.com` bằng URL Worker của bạn. Xem log trực tiếp: `npx wrangler tail tg-s3-self`; log được lưu lại của Worker (kết quả cron và lỗi, không có log từng request) nằm trong dashboard ở mục **Logs** của Worker. Chi tiết tương thích S3 (tiếng Anh): [S3-COMPAT.md](S3-COMPAT.md).

@@ -85,7 +85,7 @@ Nếu có lỗi, xem phần xử lý sự cố trong [hướng dẫn triển kha
 ## Cảnh báo bảo mật
 
 > [!WARNING]
-> 1. **Upload web được bật sẵn mặc định.** Bất kỳ ai biết URL Worker của bạn đều có thể upload file (tối đa 20 MB mỗi file) qua trang `/` và nhận link công khai, không cần đăng nhập. Worker **không có giới hạn tốc độ (rate limit) tích hợp** cho chức năng này. Nó có thể bị lạm dụng (spam, nội dung phạm pháp) và khiến bot hoặc group Telegram của bạn bị khóa.
+> 1. **Upload web được bật sẵn mặc định.** Bất kỳ ai biết URL Worker của bạn đều có thể upload file (tối đa 20 MB mỗi file) qua trang `/` và nhận link công khai, không cần đăng nhập. Giới hạn tích hợp duy nhất là **30 lượt upload mỗi phút cho mỗi IP** (IPv6: tính theo dải /64), đếm riêng ở từng vị trí (location) của Cloudflare. Nó chỉ làm chậm một kẻ lạm dụng đơn lẻ và dễ dàng bị vượt qua khi dùng nhiều IP, nên **không** phải là biện pháp bảo vệ. Trang có thể bị lạm dụng (spam, nội dung phạm pháp) và khiến bot hoặc group Telegram của bạn bị khóa. Bảo vệ thật sự là tắt hẳn hoặc đặt Cloudflare Access trước nó trên tên miền riêng.
 > 2. **Bảo vệ bằng Cloudflare**, với điều kiện dùng **tên miền riêng** trên một zone Cloudflare (quy tắc WAF và Access không áp dụng cho `*.workers.dev`):
 >    - một **quy tắc WAF rate limiting** cho đường dẫn `/api/web-upload` (ví dụ quá 5 request trong 10 giây mỗi IP → Block; có trong gói Free, xem [tài liệu Cloudflare](https://developers.cloudflare.com/waf/rate-limiting-rules/)), và/hoặc
 >    - **Cloudflare Access** (Zero Trust) chỉ cho `/api/web-upload` để chỉ những email được cho phép mới upload được. Tuyệt đối không đặt Access trước `/bot/webhook`, các đường dẫn S3 hay `/share/*`.
@@ -93,6 +93,16 @@ Nếu có lỗi, xem phần xử lý sự cố trong [hướng dẫn triển kha
 >
 >    Hướng dẫn từng bước trên dashboard: [docs/web-upload.vi.md](docs/web-upload.vi.md).
 > 3. **Hoặc tắt hẳn:** đặt GitHub Variable `WEB_UPLOAD_BUCKET` thành `off` rồi chạy lại workflow.
+
+## Độ tin cậy
+
+Khi deploy bằng GitHub Actions (cách A), bạn có thêm:
+
+- **Cron an toàn**: cứ 6 giờ Worker kiểm tra một vài file trên Telegram. Nó không bao giờ xóa gì vì lỗi từ Telegram; sự cố (mất file, bot token sai hoặc bị thu hồi, Telegram gặp trục trặc) được gửi thành tin nhắn Telegram tới mọi người dùng trong `TG_ADMIN_IDS` (mỗi admin phải `/start` bot một lần).
+- **Webhook tự phục hồi**: nếu webhook Telegram bị mất, cron sẽ đăng ký lại.
+- **Sao lưu D1 hằng ngày** vào R2 bucket `tg-s3-self-backup`, có cơ chế bảo vệ từ chối ghi đè bản sao lưu tốt bằng một database trống hoặc bị hụt dữ liệu. Sao lưu thất bại sẽ gửi email báo lỗi của GitHub và tin nhắn Telegram.
+
+Chi tiết và quy trình khôi phục: [hướng dẫn triển khai → Sao lưu và khôi phục](docs/deployment.vi.md#sao-lưu-và-khôi-phục). Cách `deploy.sh` cũng có cảnh báo từ cron và webhook tự phục hồi, nhưng không có sao lưu định kỳ.
 
 ## Kiến trúc
 
@@ -120,7 +130,7 @@ flowchart LR
 
 ## Cách khác: deploy cục bộ bằng deploy.sh
 
-Dùng cách này khi muốn deploy từ máy của bạn, hoặc để chạy processor trên VPS (Docker) cho file lớn hơn 20 MB qua Telegram Local Bot API. Yêu cầu: Node.js 22+, và Docker nếu chạy bộ dịch vụ VPS.
+Dùng cách này khi muốn deploy từ máy của bạn, hoặc để chạy processor trên VPS (Docker) cho file lớn hơn 20 MB qua Telegram Local Bot API. Yêu cầu: Node.js 22.18+, và Docker nếu chạy bộ dịch vụ VPS.
 
 ```bash
 # trong bản clone từ repo fork của bạn
@@ -215,7 +225,7 @@ Gửi file cho bot để upload vào bucket mặc định của bạn (đặt b�
 
 ## Tài liệu
 
-- [Hướng dẫn triển khai](docs/deployment.vi.md): GitHub Actions, `deploy.sh`, tên miền riêng, xử lý sự cố
+- [Hướng dẫn triển khai](docs/deployment.vi.md): GitHub Actions, `deploy.sh`, tên miền riêng, cảnh báo, sao lưu và khôi phục, xử lý sự cố
 - [Tham chiếu cấu hình](docs/configuration.vi.md): mọi biến và nơi đặt chúng
 - [Upload web](docs/web-upload.vi.md): cách hoạt động, cách tắt, bảo vệ bằng Cloudflare WAF / Access
 - [Lệnh bot](docs/bot-commands.vi.md)
@@ -241,7 +251,7 @@ Cần `X_LOCAL_EXPLORER=false` với wrangler 4.90: vì `database_id` trong `wra
 - **Xác thực:** AWS SigV4, presigned URL, Bearer token
 - **Ngôn ngữ:** TypeScript (strict mode)
 - **Xử lý media:** Sharp + FFmpeg (chỉ trên VPS)
-- **Công cụ:** wrangler v4, Node.js 22+ (CI dùng Node.js 24)
+- **Công cụ:** wrangler v4, Node.js 22.18+ (CI dùng Node.js 24)
 
 ## Ghi công
 
