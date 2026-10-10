@@ -17,6 +17,8 @@ export interface Env {
   TG_ADMIN_IDS?: string;
   // Bucket for the anonymous web upload page ("/" + POST /api/web-upload). Default "files" (wrangler.toml); "off" or empty disables it
   WEB_UPLOAD_BUCKET?: string;
+  // Rate Limiting binding for POST /api/web-upload ([[ratelimits]] in wrangler.toml); optional
+  WEB_UPLOAD_LIMITER?: RateLimit;
 }
 
 // D1 row types

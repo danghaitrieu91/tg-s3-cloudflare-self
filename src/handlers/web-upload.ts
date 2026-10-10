@@ -2,6 +2,7 @@ import type { Env } from '../types';
 import { MetadataStore } from '../storage/metadata';
 import { uploadToTelegram } from '../telegram/upload';
 import { errorResponse } from '../xml/builder';
+import { rateLimitKey } from '../utils/ip';
 
 function sanitizeFilename(name: string): string {
   return name
@@ -15,6 +16,20 @@ export async function handleWebUpload(request: Request, url: URL, env: Env, webB
   const method = request.method;
   if (method !== 'POST') {
     return errorResponse(405, 'MethodNotAllowed', 'Only POST is allowed.');
+  }
+
+  // Per-client abuse damping (Workers Rate Limiting binding; per location, best effort).
+  // Checked before the body is read. A limiter outage fails open: it is damping, not auth.
+  if (env.WEB_UPLOAD_LIMITER) {
+    let allowed = true;
+    try {
+      ({ success: allowed } = await env.WEB_UPLOAD_LIMITER.limit({ key: rateLimitKey(request.headers.get('CF-Connecting-IP')) }));
+    } catch (e) {
+      console.error('Web upload rate limiter failed, allowing request:', e instanceof Error ? e.message : e);
+    }
+    if (!allowed) {
+      return Response.json({ error: 'Too many uploads, retrying shortly' }, { status: 429, headers: { 'Retry-After': '60' } });
+    }
   }
 
   const contentLength = request.headers.get('content-length');
