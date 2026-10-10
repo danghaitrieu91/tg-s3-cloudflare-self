@@ -7,18 +7,44 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# PR runs (test only) get their own group so they never queue behind or cancel a pending deploy
 concurrency:
-  group: deploy
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'deploy' }}
   cancel-in-progress: false
 
 jobs:
+  # Runs on every PR and push, also in forks; holds no secrets
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
   deploy:
-    if: vars.DEPLOY_ENABLED == 'true'
+    needs: test
+    if: github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -115,6 +141,16 @@ jobs:
           printf '\n[[routes]]\npattern = "%s"\ncustom_domain = true\n' "$CUSTOM_DOMAIN" >> wrangler.toml
           grep -q '^workers_dev = false' wrangler.toml
 
+      - name: D1 bookmark (manual restore point)
+        run: |
+          # Time Travel bookmark taken before migrations: `wrangler d1 time-travel restore <db> --bookmark=<id>`
+          if out="$(npx wrangler d1 time-travel info "$D1_NAME" --json 2>/dev/null)"; then
+            BOOKMARK="$(printf '%s' "$out" | node -e "const j=JSON.parse(require('fs').readFileSync(0,'utf8'));process.stdout.write(String(j.bookmark||''))")" || BOOKMARK=""
+            echo "::notice::D1 bookmark before migrations: ${BOOKMARK:-unavailable}"
+          else
+            echo "::warning::Could not read a D1 Time Travel bookmark (new database?)"
+          fi
+
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply "$D1_NAME" --remote
 
@@ -184,3 +220,21 @@ jobs:
             exit 1
           fi
           echo "Webhook registered: $WORKER_URL/bot/webhook"
+
+      - name: Smoke test
+        run: |
+          # Unauthenticated GET on a nonexistent bucket goes through the D1 read and the S3 auth path:
+          # expect 403 with the Worker's S3 error body (an edge/WAF 403 does not count)
+          code=""
+          body="$RUNNER_TEMP/smoke.xml"
+          for _ in $(seq 1 12); do
+            code="$(curl -sS -o "$body" -w '%{http_code}' "$WORKER_URL/tgs3-smoke-nonexistent/x" || true)"
+            if [ "$code" = "403" ] && grep -q '<Code>AccessDenied</Code>' "$body"; then break; fi
+            [ "$code" = "403" ] && code="403-unexpected"  # 403 without the Worker's S3 body (WAF/Access)
+            sleep 10
+          done
+          if [ "$code" != "403" ]; then
+            echo "::error::Smoke test failed (HTTP $code, expected 403 AccessDenied from the Worker). The new version is live; see the D1 bookmark notice above for a manual restore point."
+            exit 1
+          fi
+          echo "Smoke test passed (403 AccessDenied from the auth path)"

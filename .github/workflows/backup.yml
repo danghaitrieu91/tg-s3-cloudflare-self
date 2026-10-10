@@ -1,0 +1,142 @@
+# Daily D1 backup to R2 + an out-of-band health check of the bot.
+# A failed run sends GitHub's own failure email, which works even when the Telegram token is broken.
+# Restore: see docs/deployment.md, "Backups and restore".
+name: D1 backup
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Own group: sharing the deploy group would let a queued backup cancel a pending deploy (and vice versa)
+concurrency:
+  group: d1-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      D1_NAME: tg-s3-self-db
+      BACKUP_BUCKET: tg-s3-self-backup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+
+      - name: Install dependencies
+        # Do not expose the Cloudflare credentials to npm lifecycle scripts
+        env:
+          CLOUDFLARE_API_TOKEN: ''
+          CLOUDFLARE_ACCOUNT_ID: ''
+        run: npm ci
+
+      - name: Resolve D1 database (read-only)
+        run: |
+          # Never create the database here: a backup job that recreates a lost DB would
+          # back up the empty replacement over the good dumps.
+          out="$(npx wrangler d1 list --json)" || { echo "::error::wrangler d1 list failed"; exit 1; }
+          DB_ID="$(printf '%s' "$out" | node -e "
+            const list = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+            const db = list.find((d) => d.name === process.env.D1_NAME);
+            process.stdout.write(db ? db.uuid : '');
+          ")"
+          if [ -z "$DB_ID" ]; then
+            echo "::error::D1 database $D1_NAME not found; not creating it. See docs/deployment.md, Backups and restore"
+            exit 1
+          fi
+          # Workspace-only edit (never committed)
+          sed -i "s/^database_id = \"\"/database_id = \"$DB_ID\"/" wrangler.toml
+          grep -q "^database_id = \"$DB_ID\"" wrangler.toml
+
+      - name: Ensure R2 backup bucket
+        run: |
+          if out="$(npx wrangler r2 bucket create "$BACKUP_BUCKET" 2>&1)"; then
+            echo "Created R2 bucket $BACKUP_BUCKET"
+          elif echo "$out" | grep -qi "already exists"; then
+            echo "R2 bucket $BACKUP_BUCKET already exists"
+          else
+            echo "$out"
+            echo "::error::Could not create R2 bucket $BACKUP_BUCKET"
+            exit 1
+          fi
+
+      - name: Export D1 (guarded, verified by a scratch restore)
+        run: |
+          prev="$RUNNER_TEMP/prev-count.json"
+          if ! out="$(npx wrangler r2 object get "$BACKUP_BUCKET/d1/last-count.json" --remote --file "$prev" 2>&1)"; then
+            rm -f "$prev"
+            # Only a missing key means "first run"; any other read error must not disarm the shrink guard
+            if ! echo "$out" | grep -q "The specified key does not exist"; then
+              echo "::error::Could not read d1/last-count.json from $BACKUP_BUCKET; refusing to run without the shrink guard"
+              exit 1
+            fi
+            prev=""
+          fi
+          scripts/d1-backup.sh remote "$RUNNER_TEMP/d1" "$prev"
+
+      - name: Upload to R2
+        run: |
+          day="$(date -u +%a)"
+          month="$(date -u +%Y-%m)"
+          # One file per snapshot: schema and data can never come from different moments
+          npx wrangler r2 object put "$BACKUP_BUCKET/d1/$day.sql" --remote --file "$RUNNER_TEMP/d1/backup.sql" >/dev/null
+          npx wrangler r2 object put "$BACKUP_BUCKET/d1/monthly/$month.sql" --remote --file "$RUNNER_TEMP/d1/backup.sql" >/dev/null
+          # Written last: only a complete upload becomes the baseline for the next guard check
+          npx wrangler r2 object put "$BACKUP_BUCKET/d1/last-count.json" --remote --file "$RUNNER_TEMP/d1/counts.json" >/dev/null
+          echo "Uploaded d1/$day.sql and d1/monthly/$month.sql"
+
+      - name: Check bot and webhook
+        # Runs after the backup (a broken bot must not stop backups) but still fails the job,
+        # so GitHub's failure email reports a revoked token even when Telegram DMs cannot.
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          # Never use -v: the request URL contains the bot token
+          me="$(curl -sS --max-time 20 "https://api.telegram.org/bot${TG_BOT_TOKEN}/getMe")" || { echo "::error::Could not reach api.telegram.org"; exit 1; }
+          wh="$(curl -sS --max-time 20 "https://api.telegram.org/bot${TG_BOT_TOKEN}/getWebhookInfo")" || { echo "::error::Could not reach api.telegram.org"; exit 1; }
+          ME="$me" WH="$wh" node -e "
+            const me = JSON.parse(process.env.ME), wh = JSON.parse(process.env.WH);
+            if (me.ok !== true) { console.log('::error::getMe failed: ' + (me.description || 'unknown') + ' (TG_BOT_TOKEN invalid or revoked?)'); process.exit(1); }
+            if (wh.ok !== true) { console.log('::error::getWebhookInfo failed: ' + (wh.description || 'unknown')); process.exit(1); }
+            if (!wh.result.url) { console.log('::error::No Telegram webhook is set; the bot is not receiving messages (the next cron run re-registers it if WORKER_URL is set)'); process.exit(1); }
+            console.log('Bot OK, webhook host: ' + new URL(wh.result.url).host);
+          "
+
+      - name: Remove local dumps
+        if: always()
+        # Dumps contain chat IDs, object keys and share tokens: never print or upload them as artifacts
+        run: rm -rf "$RUNNER_TEMP/d1" "$RUNNER_TEMP/prev-count.json"
+
+      - name: Notify admins on failure
+        if: failure() || cancelled()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_ADMIN_IDS: ${{ secrets.TG_ADMIN_IDS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Best effort: if the token itself is broken this DM fails too; GitHub's failure email still goes out
+          IFS=',' read -ra ids <<< "$TG_ADMIN_IDS"
+          for id in "${ids[@]}"; do
+            id="$(echo "$id" | tr -d ' ')"
+            [ -z "$id" ] && continue
+            BODY="$(CHAT_ID="$id" node -e "process.stdout.write(JSON.stringify({chat_id: process.env.CHAT_ID, text: 'tg-s3 daily D1 backup / bot health check failed: ' + process.env.RUN_URL}))")"
+            curl -sS --max-time 20 -o /dev/null -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -H 'Content-Type: application/json' -d "$BODY" || true
+          done

@@ -6,7 +6,7 @@ Worker phục vụ một trang kéo-thả đơn giản tại `/`. Ai mở trang 
 
 > [!WARNING]
 > **Web upload được bật sẵn và là công khai.**
-> 1. **Bất kỳ ai biết URL Worker của bạn đều có thể tải file lên** (mỗi file ≤ 20 MB) và nhận link công khai. Worker **không có đăng nhập và không có giới hạn tốc độ (rate limit)** cho trang này. Tính năng có thể bị lạm dụng (spam, nội dung phi pháp) và khiến bot hoặc nhóm Telegram của bạn bị khoá.
+> 1. **Bất kỳ ai biết URL Worker của bạn đều có thể tải file lên** (mỗi file ≤ 20 MB) và nhận link công khai. Trang này **không cần đăng nhập**; giới hạn tích hợp duy nhất là 30 lượt tải lên mỗi phút cho mỗi IP ([chi tiết](#giới-hạn-tốc-độ-tích-hợp)), dễ dàng bị vượt qua khi dùng nhiều IP và **không** phải là biện pháp bảo vệ. Tính năng có thể bị lạm dụng (spam, nội dung phi pháp) và khiến bot hoặc nhóm Telegram của bạn bị khoá.
 > 2. **Bảo vệ bằng Cloudflare**: [rate limiting rule của WAF](#phương-án-1-rate-limiting-rule-của-waf) và/hoặc [Cloudflare Access](#phương-án-2-cloudflare-access). Cả hai đều cần **tên miền riêng** thuộc một zone trên Cloudflare — chúng không bảo vệ URL `*.workers.dev`, nên phải tắt URL đó.
 > 3. **Hoặc tắt hẳn**: đặt GitHub Variable `WEB_UPLOAD_BUCKET` thành `off` rồi chạy lại workflow (nếu dùng `deploy.sh`: đặt `WEB_UPLOAD_BUCKET = "off"` trong `wrangler.toml`).
 
@@ -17,7 +17,7 @@ Worker phục vụ một trang kéo-thả đơn giản tại `/`. Ai mở trang 
 | Route | `GET /` (và `/index.html`) — trang tải lên; `POST /api/web-upload?name=<tên-file>` — endpoint tải lên (nội dung file nằm nguyên trong body). Trang chỉ được trả về cho request không xác thực: request S3 có chữ ký tới `/` (ListBuckets, ví dụ `aws s3 ls`) hoặc presigned URL vẫn đi tới S3 API như bình thường |
 | Mặc định | **BẬT**: `WEB_UPLOAD_BUCKET = "files"` trong `wrangler.toml` |
 | Giới hạn kích thước | 20 MB, kiểm tra cả header `Content-Length` lẫn số byte thực nhận (`413` nếu vượt) |
-| Xác thực | Không có. Không có rate limit tích hợp |
+| Xác thực | Không có. Giới hạn 30 request mỗi 60 giây cho mỗi client, xem [Giới hạn tốc độ tích hợp](#giới-hạn-tốc-độ-tích-hợp) |
 | Bucket | Giá trị của `WEB_UPLOAD_BUCKET` (chuyển thành chữ thường). Giá trị phải là tên bucket hợp lệ (`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` sau khi chuyển chữ thường), nếu không mọi lần tải lên đều lỗi `500`. Nếu bucket chưa tồn tại, nó được tạo ở lần tải lên đầu tiên dưới dạng bucket **công khai** trong `DEFAULT_CHAT_ID` (một lệnh insert nguyên tử, nên các lần tải lên đồng thời không tạo trùng) |
 | Bucket riêng tư đã có | Không bao giờ bị chuyển thành công khai. Tải lên sẽ lỗi `403` (`Web upload bucket is private; make it public or set WEB_UPLOAD_BUCKET=off`) |
 | Key của object | `YYYYMMDD_<tên-đã-làm-sạch>_<4 ký tự hex ngẫu nhiên>.<phần-mở-rộng>`, ví dụ `20261009_holiday_photo_3f9a.jpg`. Phần mở rộng được làm sạch giống tên file (chỉ giữ `a-z`, `0-9`, `.`, `-`) |
@@ -25,6 +25,30 @@ Worker phục vụ một trang kéo-thả đơn giản tại `/`. Ai mở trang 
 | Link trả về | `https://<worker-host>/<bucket>/<key>` — ai cũng đọc được vì bucket là công khai |
 
 File tải lên là object bình thường: bạn có thể xem và xoá chúng bằng bot, Mini App hoặc bất kỳ S3 client nào.
+
+## Giới hạn tốc độ tích hợp
+
+`POST /api/web-upload` đi qua binding Workers Rate Limiting `WEB_UPLOAD_LIMITER` (`[[ratelimits]]` trong `wrangler.toml`):
+
+| Mục | Hành vi |
+|-----|---------|
+| Giới hạn | 30 request mỗi 60 giây cho mỗi client |
+| Khoá client | Địa chỉ IPv4, hoặc dải IPv6 **/64** (một người dùng IPv6 thường sở hữu cả một dải /64) |
+| Khi vượt giới hạn | `429` kèm `Retry-After: 60`, trả về trước khi đọc body của request |
+| Trang tải lên | Khi gặp `429`, trang hiện `Rate limited, waiting Ns…`, chờ rồi gửi lại chính file đó, tối đa 3 lần |
+
+Đây **chỉ là biện pháp làm chậm**, không phải bảo vệ. Bộ đếm được giữ riêng ở từng vị trí (location) của Cloudflare và chỉ nhất quán sau một khoảng thời gian (eventually consistent), nên vài request dư vẫn có thể lọt qua, còn kẻ tấn công có nhiều địa chỉ IP thì hoàn toàn không bị chặn. Nếu chính bộ giới hạn bị lỗi, lượt tải lên vẫn được cho qua (fail open). Muốn bảo vệ thật sự, hãy tắt trang hoặc dùng [Cloudflare Access](#phương-án-2-cloudflare-access) trên tên miền riêng.
+
+Muốn đổi giới hạn, sửa `limit` và/hoặc `period` trong `wrangler.toml` rồi deploy lại (`period` phải là `10` hoặc `60`):
+
+```toml
+[[ratelimits]]
+name = "WEB_UPLOAD_LIMITER"
+namespace_id = "73201"
+simple = { limit = 30, period = 60 }
+```
+
+`namespace_id` có phạm vi toàn tài khoản: hãy giữ giá trị này không trùng giữa các Worker của bạn, nếu không chúng sẽ dùng chung bộ đếm.
 
 ## Tắt hoặc đổi bucket
 

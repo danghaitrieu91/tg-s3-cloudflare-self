@@ -669,10 +669,10 @@ export class MetadataStore {
     return row?.cnt ?? 0;
   }
 
-  async sampleObjects(limit = 10): Promise<ObjectRow[]> {
+  async sampleObjects(limit: number, maxSize: number): Promise<ObjectRow[]> {
     const result = await this.db.prepare(
-      'SELECT * FROM objects WHERE tg_file_id != \'__zero__\' ORDER BY RANDOM() LIMIT ?'
-    ).bind(limit).all<ObjectRow>();
+      'SELECT * FROM objects WHERE tg_file_id != \'__zero__\' AND size <= ? ORDER BY RANDOM() LIMIT ?'
+    ).bind(maxSize, limit).all<ObjectRow>();
     return result.results;
   }
 

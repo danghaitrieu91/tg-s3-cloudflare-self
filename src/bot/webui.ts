@@ -425,13 +425,23 @@ export function renderWebUI(origin: string): string {
 
     async function uploadFile(file) {
       try {
-        const response = await fetch(\`/api/web-upload?name=\${encodeURIComponent(file.name)}\`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': file.type || 'application/octet-stream',
-          },
-          body: file
-        });
+        let response;
+        // Server rate limit (429): wait Retry-After and resend the same file, up to 3 times
+        for (let attempt = 0; ; attempt++) {
+          response = await fetch(\`/api/web-upload?name=\${encodeURIComponent(file.name)}\`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': file.type || 'application/octet-stream',
+            },
+            body: file
+          });
+          if (response.status !== 429 || attempt >= 3) break;
+          const wait = parseInt(response.headers.get('Retry-After') || '60', 10) || 60;
+          const prevText = progressText.textContent;
+          progressText.textContent = 'Rate limited, waiting ' + wait + 's before retrying ' + file.name + '...';
+          await new Promise(r => setTimeout(r, wait * 1000));
+          progressText.textContent = prevText;
+        }
 
         if (!response.ok) {
           const err = await response.json().catch(() => ({}));

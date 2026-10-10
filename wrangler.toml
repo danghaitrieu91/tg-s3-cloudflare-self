@@ -24,3 +24,18 @@ bucket_name = "tg-s3-self-cache"
 
 [triggers]
 crons = ["0 */6 * * *"]
+
+# Per-client rate limit for the anonymous web upload (best effort, per Cloudflare location). See docs/web-upload.md
+# namespace_id is account-wide: keep it unique among your Workers so counters are not shared
+[[ratelimits]]
+name = "WEB_UPLOAD_LIMITER"
+namespace_id = "73201"
+simple = { limit = 30, period = 60 }
+
+# Workers Logs: keep console.* output, but do not store per-request invocation logs
+# (request URLs can carry Mini App auth= tokens and share passwords)
+[observability]
+enabled = true
+
+[observability.logs]
+invocation_logs = false
