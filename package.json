@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   },
   "scripts": {
     "dev": "wrangler dev",
@@ -11,6 +11,7 @@
     "deploy:docker": "./deploy.sh",
     "deploy:vps": "./deploy.sh --vps",
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mts",
     "db:init": "wrangler d1 execute tg-s3-self-db --local --file=src/storage/schema.sql",
     "db:init:remote": "wrangler d1 execute tg-s3-self-db --remote --file=src/storage/schema.sql"
   },

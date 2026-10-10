@@ -5,7 +5,7 @@ import { verifySignature, type CredentialResolver } from './auth/sigv4';
 import { generatePresignedUrl } from './auth/presigned';
 import { errorResponse } from './xml/builder';
 import { timingSafeEqual, deriveWebhookSecret } from './utils/crypto';
-import { S3_MAX_PRESIGN_EXPIRES } from './constants';
+import { S3_MAX_PRESIGN_EXPIRES, BOT_API_GETFILE_LIMIT } from './constants';
 
 // Handlers
 import { handleGetObject } from './handlers/get-object';
@@ -19,7 +19,9 @@ import { handleListBuckets, handleCreateBucket, handleDeleteBucket, handleHeadBu
 import { handleShareApi, handleShareAccess } from './handlers/share';
 import { handleWebhook } from './bot/webhook';
 import { MetadataStore } from './storage/metadata';
-import { TelegramClient } from './telegram/client';
+import { TelegramClient, TgApiError } from './telegram/client';
+import { classifyProbeError, probeIssues, type ProbeResult } from './telegram/integrity';
+import { checkWebhook, notifyAdmins, workerBaseUrl } from './ops/health';
 import { cleanR2Cache } from './handlers/get-object';
 import { renderMiniApp } from './bot/miniapp';
 import { renderWebUI } from './bot/webui';
@@ -45,7 +47,7 @@ export default {
       return handleWebhook(request, env);
     }
 
-    // Web upload: public drag-and-drop page at "/" + anonymous POST /api/web-upload (no login, no rate limit).
+    // Web upload: public drag-and-drop page at "/" + anonymous POST /api/web-upload (no login; per-client rate limit via WEB_UPLOAD_LIMITER).
     // Enabled by default (WEB_UPLOAD_BUCKET = "files" in wrangler.toml); disable with WEB_UPLOAD_BUCKET=off.
     const webBucket = (env.WEB_UPLOAD_BUCKET ?? '').trim();
     if (webBucket && webBucket.toLowerCase() !== 'off') {
@@ -248,12 +250,51 @@ export default {
 
   async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
     const store = new MetadataStore(env);
+    const cronBaseUrl = workerBaseUrl(env) ?? '';
 
-    if (!env.WORKER_URL) {
-      console.warn('Cron: WORKER_URL not set, CDN cache purge during consistency cleanup will be skipped.');
+    if (!cronBaseUrl) {
+      console.warn('Cron: WORKER_URL not set: webhook self-heal and CDN cache purge during cleanup are skipped.');
     }
 
-    // Each task is independently try-caught so a failure in one doesn't block the rest
+    // Health first: Workers Free allows 50 subrequests per invocation, so the webhook check,
+    // the integrity probe and the admin alert run before the cleanup fan-out below.
+    const issues: string[] = [];
+    try {
+      const wh = await checkWebhook(env);
+      if (wh) issues.push(wh);
+    } catch (e) { console.error('Cron: webhook check failed:', e); }
+
+    // Integrity probe: read-only. A getFile failure is reported to admins, NEVER deleted on
+    // (see src/telegram/integrity.ts). Only objects the cloud Bot API can serve (<= 20 MB) are probed.
+    // Budget: <= 12 probes x 3 attempts and a 120 s deadline.
+    const probe: ProbeResult = { probed: 0, bad400: [], unauthorized: 0, transient: 0 };
+    try {
+      const tg = new TelegramClient(env);
+      const totalCount = await store.countObjects();
+      const sampleSize = Math.min(12, Math.max(5, Math.ceil(totalCount * 0.02)));
+      const samples = await store.sampleObjects(sampleSize, BOT_API_GETFILE_LIMIT);
+      const deadline = Date.now() + 120_000;
+      for (const obj of samples) {
+        if (Date.now() > deadline) break;
+        probe.probed++;
+        try {
+          await tg.getFile(obj.tg_file_id);
+        } catch (e) {
+          const outcome = classifyProbeError(e instanceof TgApiError ? e.status : undefined, e instanceof Error ? e.message : String(e));
+          if (outcome === 'bad400') probe.bad400.push({ bucket: obj.bucket, key: obj.key });
+          else if (outcome === 'unauthorized') probe.unauthorized++;
+          else probe.transient++;
+          console.warn(`Integrity probe: ${outcome} for ${obj.bucket}/${obj.key}`);
+        }
+      }
+      issues.push(...probeIssues(probe));
+    } catch (e) { console.error('Cron: integrity probe failed:', e); }
+
+    let alert = { admins: 0, delivered: 0 };
+    if (issues.length > 0) alert = await notifyAdmins(env, issues);
+
+    // Cleanup tasks: each independently try-caught so a failure in one doesn't block the rest.
+    // Failures here are logged only (no second DM: keeps the subrequest budget fixed).
 
     let expiredShares = 0;
     try {
@@ -277,36 +318,6 @@ export default {
       }
     } catch (e) { console.error('Cron: cleanStaleMultiparts failed:', e); }
 
-    let inconsistent = 0;
-    try {
-      const { TgApiError } = await import('./telegram/client');
-      const tg = new TelegramClient(env);
-      // Dynamic sampling: 2% of objects, clamped to [5, 50]
-      const totalCount = await store.countObjects();
-      const sampleSize = Math.min(50, Math.max(5, Math.ceil(totalCount * 0.02)));
-      const samples = await store.sampleObjects(sampleSize);
-      for (const obj of samples) {
-        try {
-          await tg.getFile(obj.tg_file_id);
-        } catch (e) {
-          // Only delete if TG explicitly says the file is invalid (400 Bad Request).
-          // Transient errors (timeout, network, FloodWait, 5xx) should NOT trigger deletion.
-          if (e instanceof TgApiError && e.status === 400) {
-            inconsistent++;
-            await store.deleteObject(obj.bucket, obj.key);
-            // Full cleanup: TG message, derivatives, share tokens, CDN/R2 cache
-            const cronBaseUrl = env.WORKER_URL
-              ? (env.WORKER_URL.startsWith('http') ? env.WORKER_URL : `https://${env.WORKER_URL}`)
-              : '';
-            await cleanupDeletedObject(obj.bucket, obj.key, obj, cronBaseUrl, env, store);
-            console.log(`Consistency: removed orphaned D1 record ${obj.bucket}/${obj.key}`);
-          } else {
-            console.warn(`Consistency: skipped ${obj.bucket}/${obj.key} due to transient error: ${e instanceof Error ? e.message : e}`);
-          }
-        }
-      }
-    } catch (e) { console.error('Cron: D1-TG consistency check failed:', e); }
-
     let r2Cleaned = 0;
     try {
       r2Cleaned = await cleanR2Cache(env, store, 20);
@@ -329,7 +340,7 @@ export default {
       }
     } catch (e) { console.error('Cron: cleanOrphanedChunks failed:', e); }
 
-    // Lifecycle rules: delete expired objects
+    // Lifecycle rules: delete expired objects (user-configured, intentional deletes)
     let lifecycleDeleted = 0;
     try {
       const expired = await store.findExpiredObjects(50);
@@ -338,16 +349,18 @@ export default {
           const objRow = await store.getObject(obj.bucket, obj.key);
           if (!objRow) continue;
           await store.deleteObject(obj.bucket, obj.key);
-          const cronBaseUrl = env.WORKER_URL
-            ? (env.WORKER_URL.startsWith('http') ? env.WORKER_URL : `https://${env.WORKER_URL}`)
-            : '';
           await cleanupDeletedObject(obj.bucket, obj.key, objRow, cronBaseUrl, env, store);
           lifecycleDeleted++;
         } catch (e) { console.warn(`Lifecycle: failed to delete ${obj.bucket}/${obj.key}:`, e); }
       }
     } catch (e) { console.error('Cron: lifecycle evaluation failed:', e); }
 
-    console.log(`Cron cleanup: ${expiredShares} expired shares, ${orphanedShares} orphaned shares, ${staleUploads} stale multipart uploads, ${inconsistent} inconsistent objects, ${r2Cleaned} stale R2 cache entries, ${expiredAttempts} expired password attempts, ${orphanedChunks} orphaned chunks, ${lifecycleDeleted} lifecycle-expired objects`);
+    console.log(`Cron: probed=${probe.probed} bad400=${probe.bad400.length} unauthorized=${probe.unauthorized} transient=${probe.transient}, issues=${issues.length} alerted=${alert.delivered}/${alert.admins}; cleanup: ${expiredShares} expired shares, ${orphanedShares} orphaned shares, ${staleUploads} stale multipart uploads, ${r2Cleaned} stale R2 cache entries, ${expiredAttempts} expired password attempts, ${orphanedChunks} orphaned chunks, ${lifecycleDeleted} lifecycle-expired objects`);
+
+    // Make undelivered alerts visible in Cron Events / Workers Logs
+    if (issues.length > 0 && alert.admins > 0 && alert.delivered === 0) {
+      throw new Error('cron alerts undelivered');
+    }
   },
 };
 
